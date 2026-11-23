@@ -7,17 +7,10 @@
 group = "com.flutter_rust_bridge.rust_lib_tor"
 version = "1.0"
 
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-
-    dependencies {
-        // The Android Gradle Plugin knows how to build native code with the NDK.
-        classpath("com.android.tools.build:gradle:9.0.1")
-    }
-}
+// No buildscript classpath: this plugin is only ever built inside a Flutter
+// app, whose settings (or root buildscript) already put the Android Gradle
+// Plugin on a parent classloader, and that copy wins. A version pinned here
+// would be downloaded on every clean build and then never used.
 
 rootProject.allprojects {
     repositories {
