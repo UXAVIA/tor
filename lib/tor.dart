@@ -41,7 +41,11 @@ class ClientNotActive implements Exception {
 class TorProxyFailure {
   final String message;
 
-  TorProxyFailure(this.message);
+  /// True when [Tor.stopAllInProcess], called from any isolate, stopped the
+  /// proxy; false when it failed by itself.
+  final bool processWideStop;
+
+  TorProxyFailure(this.message, {this.processWideStop = false});
 
   @override
   String toString() => 'TorProxyFailure: $message';
@@ -122,16 +126,29 @@ class Tor {
   /// Each isolate has its own [Tor.instance], and [stop] only reaches the
   /// proxy of the isolate it is called from. This also reaches proxies whose
   /// isolate has died without stopping them (an engine destroyed without any
-  /// Dart callback, say), which nothing else can stop. It also cancels every
-  /// start and bootstrap in flight in the process, so nothing started before
-  /// this call is left running after it; such a start or bootstrap fails
-  /// with [CouldntBootstrapDirectory].
+  /// Dart callback, say), which nothing else can stop.
+  ///
+  /// It also cancels every start and bootstrap in flight in the process, this
+  /// isolate's included: such a start or bootstrap fails with
+  /// [CouldntBootstrapDirectory]. It then waits, for up to 15 seconds, for
+  /// every start, bootstrap and stop that was already running to end. When it
+  /// returns normally, nothing started before it holds a SOCKS listener or
+  /// Arti's state and cache locks. "Started before it" means the native call
+  /// had begun running; a call still queued for a native worker thread isn't
+  /// covered.
+  ///
+  /// Throws a [TorError] (`TorError.proxyStopError`) when some proxy failed to
+  /// stop or something it waited for was still running. Every proxy has
+  /// still been asked to stop, so there is nothing to retry, but the
+  /// guarantee above may not hold.
   ///
   /// The native side can't tell an orphan from a live isolate's proxy, so it
   /// stops those too. A live isolate, this one included, sees its proxy's
-  /// loss as a failure: its [port] becomes -1 and [failures] reports it, as
-  /// for any unexpected proxy exit. Clients started after this returns are
-  /// unaffected.
+  /// loss as a failure, as for any unexpected proxy exit: its [port] becomes
+  /// -1 and [failures] reports a [TorProxyFailure] whose
+  /// [TorProxyFailure.processWideStop] is true. That happens asynchronously,
+  /// so expect it after this returns, not before. Clients started after this
+  /// returns are unaffected.
   static Future<int> stopAllInProcess() async {
     await ensureRustLibInit();
     return rust.stopAllProxies();
@@ -383,8 +400,10 @@ class Tor {
     // Not queued behind the lifecycle: an engine destroyed while this waited
     // would lose the stop and leave the proxy listening with no handle left.
     // The call reaches the native worker before this method returns. It ends
-    // the accept loop and the client's tasks but leaves the client itself to
-    // the dispose below, which still waits for calls in flight on it.
+    // the accept loop and the client's tasks and releases the client itself;
+    // a bootstrap in flight keeps its own reference until it ends, and a
+    // dormant call in flight holds the stop off until it returns. The dispose
+    // below only drops this isolate's wrapper, after those calls.
     final nativeStop =
         proxy == null ? null : Future.sync(() => rust.stopProxy(proxy: proxy));
 
@@ -415,13 +434,18 @@ class Tor {
     int generation,
   ) async {
     try {
-      final message = await rust.waitForProxyExit(monitor: monitor);
-      if (message == null ||
+      final loss = await rust.waitForProxyExit(monitor: monitor);
+      if (loss == null ||
           !_lifecycle.owns(generation) ||
           !identical(_proxy, proxy)) {
         return;
       }
-      await _handleProxyFailure(proxy, generation, message);
+      await _handleProxyFailure(
+        proxy,
+        generation,
+        loss.message,
+        processWideStop: loss.processWideStop,
+      );
     } catch (error) {
       await _handleProxyFailure(proxy, generation, error.toString());
     }
@@ -430,8 +454,9 @@ class Tor {
   Future<void> _handleProxyFailure(
     rust.TorProxyHandle proxy,
     int generation,
-    String message,
-  ) async {
+    String message, {
+    bool processWideStop = false,
+  }) async {
     if (!_lifecycle.owns(generation) || !identical(_proxy, proxy)) return;
 
     try {
@@ -439,7 +464,9 @@ class Tor {
     } catch (error) {
       message = '$message; teardown failed: $error';
     } finally {
-      failures.add(TorProxyFailure(message));
+      failures.add(
+        TorProxyFailure(message, processWideStop: processWideStop),
+      );
     }
   }
 
@@ -452,8 +479,8 @@ class Tor {
         await rust.stopProxy(proxy: proxy);
       }
     } finally {
-      // Drop the Rust client now instead of at GC: a lingering client holds
-      // tor_cache/dir.lock, forcing a restarted client's dirmgr into read-only.
+      // The native stop has released the client; this frees the wrapper now
+      // rather than at GC.
       client?.dispose();
     }
   }

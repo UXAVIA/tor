@@ -135,7 +135,7 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiTorStopProxy({required TorProxyHandle proxy});
 
-  Future<String?> crateApiTorWaitForProxyExit(
+  Future<TorProxyLoss?> crateApiTorWaitForProxyExit(
       {required TorProxyMonitor monitor});
 
   RustArcIncrementStrongCountFnType
@@ -692,7 +692,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<String?> crateApiTorWaitForProxyExit(
+  Future<TorProxyLoss?> crateApiTorWaitForProxyExit(
       {required TorProxyMonitor monitor}) {
     return handler.executeNormal(NormalTask(
       callFfi: (port_) {
@@ -703,7 +703,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             funcId: 20, port: port_);
       },
       codec: SseCodec(
-        decodeSuccessData: sse_decode_opt_String,
+        decodeSuccessData: sse_decode_opt_box_autoadd_tor_proxy_loss,
         decodeErrorData: sse_decode_tor_error,
       ),
       constMeta: kCrateApiTorWaitForProxyExitConstMeta,
@@ -886,15 +886,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  TorProxyLoss dco_decode_box_autoadd_tor_proxy_loss(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_tor_proxy_loss(raw);
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
   }
 
   @protected
-  String? dco_decode_opt_String(dynamic raw) {
+  TorProxyLoss? dco_decode_opt_box_autoadd_tor_proxy_loss(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
-    return raw == null ? null : dco_decode_String(raw);
+    return raw == null ? null : dco_decode_box_autoadd_tor_proxy_loss(raw);
   }
 
   @protected
@@ -926,6 +932,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       default:
         throw Exception("unreachable");
     }
+  }
+
+  @protected
+  TorProxyLoss dco_decode_tor_proxy_loss(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return TorProxyLoss(
+      message: dco_decode_String(arr[0]),
+      processWideStop: dco_decode_bool(arr[1]),
+    );
   }
 
   @protected
@@ -1104,6 +1122,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  TorProxyLoss sse_decode_box_autoadd_tor_proxy_loss(
+      SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_tor_proxy_loss(deserializer));
+  }
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
@@ -1111,11 +1136,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  String? sse_decode_opt_String(SseDeserializer deserializer) {
+  TorProxyLoss? sse_decode_opt_box_autoadd_tor_proxy_loss(
+      SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     if (sse_decode_bool(deserializer)) {
-      return (sse_decode_String(deserializer));
+      return (sse_decode_box_autoadd_tor_proxy_loss(deserializer));
     } else {
       return null;
     }
@@ -1147,6 +1173,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       default:
         throw UnimplementedError('');
     }
+  }
+
+  @protected
+  TorProxyLoss sse_decode_tor_proxy_loss(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_message = sse_decode_String(deserializer);
+    var var_processWideStop = sse_decode_bool(deserializer);
+    return TorProxyLoss(
+        message: var_message, processWideStop: var_processWideStop);
   }
 
   @protected
@@ -1344,6 +1379,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_tor_proxy_loss(
+      TorProxyLoss self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_tor_proxy_loss(self, serializer);
+  }
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
       Uint8List self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -1352,12 +1394,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_opt_String(String? self, SseSerializer serializer) {
+  void sse_encode_opt_box_autoadd_tor_proxy_loss(
+      TorProxyLoss? self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     sse_encode_bool(self != null, serializer);
     if (self != null) {
-      sse_encode_String(self, serializer);
+      sse_encode_box_autoadd_tor_proxy_loss(self, serializer);
     }
   }
 
@@ -1383,6 +1426,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_i_32(5, serializer);
         sse_encode_String(field0, serializer);
     }
+  }
+
+  @protected
+  void sse_encode_tor_proxy_loss(TorProxyLoss self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.message, serializer);
+    sse_encode_bool(self.processWideStop, serializer);
   }
 
   @protected

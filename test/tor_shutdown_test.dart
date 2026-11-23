@@ -59,6 +59,25 @@ void main() {
     expect(native.stops, 1);
   });
 
+  test('stop disposes the client only after the native stop resolves',
+      () async {
+    native.startResult.complete(native.instance);
+    await tor.start();
+    final gate = native.stopGate = Completer<void>();
+
+    final stop = tor.stop();
+    await Future<void>.delayed(Duration.zero);
+    final stopsWhileGated = native.stops;
+    final disposedWhileGated = native.instance.client.isDisposed;
+    gate.complete();
+    await stop;
+
+    expect(stopsWhileGated, 1);
+    expect(disposedWhileGated, isFalse,
+        reason: 'the client was disposed before the native stop resolved');
+    expect(native.instance.client.isDisposed, isTrue);
+  });
+
   test('a native stop that fails early is reported once, by stop', () async {
     native.startResult.complete(native.instance);
     await tor.start();
@@ -94,10 +113,9 @@ void main() {
 
     expect(await Tor.stopAllInProcess(), 1);
 
-    expect(
-      (await failure).message,
-      'Tor proxy was stopped by a process-wide stop',
-    );
+    final lost = await failure;
+    expect(lost.message, 'Tor proxy was stopped by a process-wide stop');
+    expect(lost.processWideStop, isTrue);
     expect(tor.port, -1);
     expect(tor.started, isFalse);
     // The owner's own stop still runs; natively it finds nothing left to do.

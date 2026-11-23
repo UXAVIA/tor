@@ -91,12 +91,15 @@ class FakeTorApi implements RustLibApi {
   late Completer<void> bootstrapEntered;
   late Completer<void> dormantResult;
   late Completer<void> dormantEntered;
-  late Completer<String?> exit;
+  late Completer<rust.TorProxyLoss?> exit;
   late FakeTorInstance instance;
   late FakeTorToken token;
   String? startStateDir;
   String? startCacheDir;
   Object? stopError;
+
+  /// When set, a native stop doesn't resolve until this completes.
+  Completer<void>? stopGate;
   int stops = 0;
   int sweeps = 0;
   int sweepResult = 0;
@@ -114,6 +117,7 @@ class FakeTorApi implements RustLibApi {
     startCacheDir = null;
     stops = 0;
     stopError = null;
+    stopGate = null;
     sweeps = 0;
     sweepResult = 0;
   }
@@ -159,6 +163,8 @@ class FakeTorApi implements RustLibApi {
       {required rust.TorProxyHandle proxy}) async {
     stops++;
     if (!exit.isCompleted) exit.complete(null);
+    final gate = stopGate;
+    if (gate != null) await gate.future;
     if (stopError != null) throw stopError!;
   }
 
@@ -167,13 +173,16 @@ class FakeTorApi implements RustLibApi {
   Future<int> crateApiTorStopAllProxies() async {
     sweeps++;
     if (!exit.isCompleted) {
-      exit.complete('Tor proxy was stopped by a process-wide stop');
+      exit.complete(const rust.TorProxyLoss(
+        message: 'Tor proxy was stopped by a process-wide stop',
+        processWideStop: true,
+      ));
     }
     return sweepResult;
   }
 
   @override
-  Future<String?> crateApiTorWaitForProxyExit(
+  Future<rust.TorProxyLoss?> crateApiTorWaitForProxyExit(
           {required rust.TorProxyMonitor monitor}) =>
       exit.future;
 

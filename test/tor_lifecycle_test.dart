@@ -165,10 +165,15 @@ void main() {
     addTearDown(subscription.cancel);
     final failure = tor.failures.stream.first;
     native.startResult.complete(native.instance);
-    native.exit.complete('accept loop failed');
+    native.exit.complete(const rust.TorProxyLoss(
+      message: 'accept loop failed',
+      processWideStop: false,
+    ));
 
     await tor.start();
-    expect((await failure).message, 'accept loop failed');
+    final lost = await failure;
+    expect(lost.message, 'accept loop failed');
+    expect(lost.processWideStop, isFalse);
     expect(tor.port, -1);
     expect(native.stops, 1);
     expect(native.instance.client.isDisposed, isTrue);

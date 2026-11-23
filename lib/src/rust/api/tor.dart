@@ -8,9 +8,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'tor.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `begin`, `create_arti_runtime`, `error_chain`, `finish_failed_start`, `lock_registry`, `monitor_proxy`, `new`, `new`, `publish`, `remove`, `start_proxy_internal`, `stop_all_registered`, `stop_and_wait`, `stop_proxy_inner`, `stop_registered_proxy`, `tor_client_config`, `wait_for_bootstrap`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `BootstrapWaitError`, `LiveProxy`, `PendingBootstrap`, `ProxyRegistry`, `RUNTIME`, `StopReason`, `TorProxyExit`, `TorProxyState`, `TrackedSpawner`, `TrackedTasks`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `block_on`, `blocking_io`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `deref`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `initialize`, `reenter_block_on`, `spawn_blocking`, `spawn_obj`
+// These functions are ignored because they are not marked as `pub`: `begin`, `bootstrap_with`, `bootstrap`, `client`, `create_arti_runtime`, `error_chain`, `finish_failed_start`, `lock_unpoisoned`, `lock`, `monitor_proxy`, `new`, `new`, `publish_started`, `publish`, `release_client`, `start_proxy_internal`, `start_tor_with`, `stop_all_registered`, `stop_and_wait`, `stop_error_detail`, `stop_proxy_inner`, `stop_registered_proxy`, `stop`, `tor_client_config`, `wait_for_bootstrap`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `BootstrapWaitError`, `InFlight`, `RUNTIME`, `RegistryState`, `Registry`, `StopReason`, `TorProxyExit`, `TorProxyState`, `TrackedSpawner`, `TrackedTasks`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `block_on`, `blocking_io`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `deref`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `initialize`, `reenter_block_on`, `spawn_blocking`, `spawn_obj`
 // These functions are ignored (category: IgnoreBecauseOwnerTyShouldIgnore): `default`
 
 /// Start Tor client and proxy
@@ -28,12 +28,16 @@ Future<TorInstance> startTor(
         cacheDir: cacheDir,
         cancellationToken: cancellationToken);
 
-Future<String?> waitForProxyExit({required TorProxyMonitor monitor}) =>
+/// Wait for the proxy's accept loop to end
+///
+/// Returns `None` when its owner stopped it, and how it was lost otherwise.
+Future<TorProxyLoss?> waitForProxyExit({required TorProxyMonitor monitor}) =>
     RustLib.instance.api.crateApiTorWaitForProxyExit(monitor: monitor);
 
 /// Re-bootstrap the Tor client
 ///
-/// Call this after network changes or to refresh the connection.
+/// Call this after network changes or to refresh the connection. Fails with
+/// `ClientNotInitialized` once the client's proxy has stopped.
 Future<void> bootstrap(
         {required TorClientWrapper client,
         required TorBootstrapCancellationToken cancellationToken}) =>
@@ -44,6 +48,8 @@ Future<void> bootstrap(
 ///
 /// * `soft_mode` - If true, uses Soft dormant mode (keeps some circuits warm)
 ///   If false, uses Normal mode (full operation)
+///
+/// Does nothing once the client's proxy has stopped.
 Future<void> setDormant(
         {required TorClientWrapper client, required bool softMode}) =>
     RustLib.instance.api
@@ -51,9 +57,10 @@ Future<void> setDormant(
 
 /// Stop the Tor proxy
 ///
-/// Stops the accept loop and the client runtime that owns accepted connections.
-/// Stopping a proxy that is already stopped, or being stopped, does nothing
-/// and returns once that stop has finished.
+/// Stops the accept loop and the client runtime that owns accepted
+/// connections, and releases the client. Stopping a proxy that is already
+/// stopped, or being stopped, does nothing and returns once that stop has
+/// finished.
 Future<void> stopProxy({required TorProxyHandle proxy}) =>
     RustLib.instance.api.crateApiTorStopProxy(proxy: proxy);
 
@@ -61,11 +68,18 @@ Future<void> stopProxy({required TorProxyHandle proxy}) =>
 ///
 /// Stops every proxy started in this process that hasn't been stopped yet,
 /// whichever isolate started it, including one whose isolate no longer
-/// exists, and cancels every bootstrap in flight, so nothing started before
-/// this call is left running after it. Returns how many proxies it stopped.
+/// exists, and cancels every bootstrap in flight. It then waits, for up to 15
+/// seconds, for every start, re-bootstrap and stop that was already running
+/// when it was called to end. "Already running" means the native call had
+/// begun: a call still queued for a worker thread isn't covered.
+///
+/// Returns how many proxies it stopped. Once it has returned `Ok`, nothing
+/// started before it still holds a SOCKS listener or a client, so Arti's
+/// state and cache locks are free. An error means that may not hold: a proxy
+/// failed to stop, or something it waited for was still running.
 ///
 /// It can't tell an orphan from a live isolate's proxy: a live owner's proxy
-/// monitor reports the stop as a failure.
+/// monitor reports the stop as a loss with `process_wide_stop` set.
 Future<int> stopAllProxies() =>
     RustLib.instance.api.crateApiTorStopAllProxies();
 
@@ -134,4 +148,28 @@ sealed class TorError with _$TorError implements FrbException {
   const factory TorError.configError(
     String field0,
   ) = TorError_ConfigError;
+}
+
+/// How a published proxy was lost without its owner stopping it.
+class TorProxyLoss {
+  final String message;
+
+  /// True when `stop_all_proxies` stopped it, false when it failed by itself.
+  final bool processWideStop;
+
+  const TorProxyLoss({
+    required this.message,
+    required this.processWideStop,
+  });
+
+  @override
+  int get hashCode => message.hashCode ^ processWideStop.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TorProxyLoss &&
+          runtimeType == other.runtimeType &&
+          message == other.message &&
+          processWideStop == other.processWideStop;
 }
