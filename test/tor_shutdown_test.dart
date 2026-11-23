@@ -28,8 +28,19 @@ void main() {
     expect(native.stops, 1);
   });
 
-  test('stop waits for an active dormant call before disposing the client',
-      () async {
+  test('stop issues the native stop before it returns', () async {
+    native.startResult.complete(native.instance);
+    await tor.start();
+
+    final stop = tor.stop();
+    expect(native.stops, 1);
+    await stop;
+    expect(native.instance.client.isDisposed, isTrue);
+  });
+
+  test(
+      'stop does not hold the native stop behind an active dormant call, '
+      'but still disposes the client after it', () async {
     native.startResult.complete(native.instance);
     await tor.start();
     final dormant = tor.setClientDormant(true);
@@ -42,10 +53,56 @@ void main() {
     native.dormantResult.complete();
     await Future.wait([dormant, stop]);
 
-    expect(stopsWhileDormantPending, 0);
+    expect(stopsWhileDormantPending, 1);
     expect(disposedWhileDormantPending, isFalse);
     expect(native.instance.client.isDisposed, isTrue);
     expect(native.stops, 1);
+  });
+
+  test('a native stop that fails early is reported once, by stop', () async {
+    native.startResult.complete(native.instance);
+    await tor.start();
+    final dormant = tor.setClientDormant(true);
+    await native.dormantEntered.future;
+    native.stopError = const rust.TorError.proxyStopError('cleanup timed out');
+
+    final stop = tor.stop();
+    final stopFailed = expectLater(stop, throwsA(isA<rust.TorError>()));
+    // The native stop has failed while the dispose is still queued.
+    await Future<void>.delayed(Duration.zero);
+    native.dormantResult.complete();
+
+    await dormant;
+    await stopFailed;
+    expect(native.stops, 1);
+    expect(native.instance.client.isDisposed, isTrue);
+  });
+
+  test('stopAllInProcess returns how many proxies the native sweep stopped',
+      () async {
+    native.sweepResult = 2;
+
+    expect(await Tor.stopAllInProcess(), 2);
+    expect(native.sweeps, 1);
+  });
+
+  test('a process-wide stop reaches a live owner as a proxy failure', () async {
+    final failure = tor.failures.stream.first;
+    native.startResult.complete(native.instance);
+    await tor.start();
+    native.sweepResult = 1;
+
+    expect(await Tor.stopAllInProcess(), 1);
+
+    expect(
+      (await failure).message,
+      'Tor proxy was stopped by a process-wide stop',
+    );
+    expect(tor.port, -1);
+    expect(tor.started, isFalse);
+    // The owner's own stop still runs; natively it finds nothing left to do.
+    expect(native.stops, 1);
+    expect(native.instance.client.isDisposed, isTrue);
   });
 
   test('stop skips a queued dormant call from the previous generation',

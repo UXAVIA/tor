@@ -98,6 +98,8 @@ class FakeTorApi implements RustLibApi {
   String? startCacheDir;
   Object? stopError;
   int stops = 0;
+  int sweeps = 0;
+  int sweepResult = 0;
 
   void reset() {
     startResult = Completer();
@@ -112,6 +114,8 @@ class FakeTorApi implements RustLibApi {
     startCacheDir = null;
     stops = 0;
     stopError = null;
+    sweeps = 0;
+    sweepResult = 0;
   }
 
   @override
@@ -156,6 +160,16 @@ class FakeTorApi implements RustLibApi {
     stops++;
     if (!exit.isCompleted) exit.complete(null);
     if (stopError != null) throw stopError!;
+  }
+
+  /// Like the native sweep, ends a live proxy as an unexpected exit.
+  @override
+  Future<int> crateApiTorStopAllProxies() async {
+    sweeps++;
+    if (!exit.isCompleted) {
+      exit.complete('Tor proxy was stopped by a process-wide stop');
+    }
+    return sweepResult;
   }
 
   @override

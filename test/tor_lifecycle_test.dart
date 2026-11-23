@@ -144,6 +144,7 @@ void main() {
     await native.bootstrapEntered.future;
 
     final stop = tor.stop();
+    final stopsWhileBootstrapPending = native.stops;
     expect(native.token.cancelled, isTrue);
     expect(native.instance.client.isDisposed, isFalse);
     expect(tor.port, -1);
@@ -152,6 +153,8 @@ void main() {
     );
 
     await Future.wait([bootstrap, stop]);
+    expect(stopsWhileBootstrapPending, 1,
+        reason: 'the native stop waited for the bootstrap');
     expect(native.instance.client.isDisposed, isTrue);
     expect(tor.bootstrapped, isFalse);
   });

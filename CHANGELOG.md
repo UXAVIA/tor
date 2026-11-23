@@ -4,6 +4,11 @@ SPDX-FileCopyrightText: 2024 Foundation Devices Inc.
 SPDX-License-Identifier: MIT
 -->
 
+## Unreleased
+
+* Added `Tor.stopAllInProcess()`, which stops every Tor proxy in the process, including one whose isolate died without stopping it, and cancels every bootstrap in flight.
+* `Tor.stop()` issues the native stop at once instead of queueing it behind an in-flight start, bootstrap or dormant call.
+
 ## 0.2.2
 
 * Added compatibility with Gradle 9.1 and Android Gradle Plugin 9.0.1.

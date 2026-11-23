@@ -116,6 +116,27 @@ class Tor {
   /// Getter for the singleton instance of the Tor class.
   static Tor get instance => _instance;
 
+  /// Stops every Tor proxy in this process, whichever isolate started it, and
+  /// returns how many it stopped.
+  ///
+  /// Each isolate has its own [Tor.instance], and [stop] only reaches the
+  /// proxy of the isolate it is called from. This also reaches proxies whose
+  /// isolate has died without stopping them (an engine destroyed without any
+  /// Dart callback, say), which nothing else can stop. It also cancels every
+  /// start and bootstrap in flight in the process, so nothing started before
+  /// this call is left running after it; such a start or bootstrap fails
+  /// with [CouldntBootstrapDirectory].
+  ///
+  /// The native side can't tell an orphan from a live isolate's proxy, so it
+  /// stops those too. A live isolate, this one included, sees its proxy's
+  /// loss as a failure: its [port] becomes -1 and [failures] reports it, as
+  /// for any unexpected proxy exit. Clients started after this returns are
+  /// unaffected.
+  static Future<int> stopAllInProcess() async {
+    await ensureRustLibInit();
+    return rust.stopAllProxies();
+  }
+
   /// Initialize the Tor ffi lib instance if it hasn't already been set. Nothing
   /// changes if _tor is already been set.
   ///
@@ -335,6 +356,11 @@ class Tor {
   }
 
   /// Stops the proxy
+  ///
+  /// The native stop of the published proxy is issued before this returns,
+  /// so it happens even if the engine is torn down straight after. Disposing
+  /// the client still waits for that stop and for any start, bootstrap or
+  /// dormant call in flight.
   Future<void> stop() {
     final proxy = _proxy;
     final client = _client;
@@ -354,6 +380,14 @@ class Tor {
     _bootstrapped = false;
     broadcastState();
 
+    // Not queued behind the lifecycle: an engine destroyed while this waited
+    // would lose the stop and leave the proxy listening with no handle left.
+    // The call reaches the native worker before this method returns. It ends
+    // the accept loop and the client's tasks but leaves the client itself to
+    // the dispose below, which still waits for calls in flight on it.
+    final nativeStop =
+        proxy == null ? null : Future.sync(() => rust.stopProxy(proxy: proxy));
+
     // The queue continues after errors, so also observe the operations whose
     // unpublished resources it is waiting to release. Wait for cleanup even
     // when an operation fails before reporting the error to the stop caller.
@@ -362,7 +396,10 @@ class Tor {
       if (previousStop != null) previousStop,
       if (_startInFlight != null) _startInFlight!,
       if (_bootstrapInFlight != null) _bootstrapInFlight!,
-      _lifecycle.run(() => _stopResources(proxy, client)),
+      // Listened to here, at once, so a failure is never reported unhandled
+      // while the queue below is still waiting for earlier operations.
+      if (nativeStop != null) nativeStop,
+      _lifecycle.run(() => _disposeAfter(nativeStop, client)),
     ]).then((_) {}).whenComplete(() {
       if (identical(_stopInFlight, stop)) {
         _stopInFlight = null;
@@ -417,6 +454,17 @@ class Tor {
     } finally {
       // Drop the Rust client now instead of at GC: a lingering client holds
       // tor_cache/dir.lock, forcing a restarted client's dirmgr into read-only.
+      client?.dispose();
+    }
+  }
+
+  Future<void> _disposeAfter(
+    Future<void>? nativeStop,
+    rust.TorClientWrapper? client,
+  ) async {
+    try {
+      await nativeStop;
+    } finally {
       client?.dispose();
     }
   }

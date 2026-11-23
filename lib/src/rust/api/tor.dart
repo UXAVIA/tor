@@ -8,9 +8,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'tor.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `create_arti_runtime`, `finish_failed_start`, `monitor_proxy`, `new`, `start_proxy_internal`, `stop_and_wait`, `wait_for_bootstrap`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `BootstrapWaitError`, `RUNTIME`, `TorProxyExit`, `TorProxyState`, `TrackedSpawner`, `TrackedTasks`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `block_on`, `blocking_io`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `deref`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `initialize`, `reenter_block_on`, `spawn_blocking`, `spawn_obj`
+// These functions are ignored because they are not marked as `pub`: `begin`, `create_arti_runtime`, `error_chain`, `finish_failed_start`, `lock_registry`, `monitor_proxy`, `new`, `new`, `publish`, `remove`, `start_proxy_internal`, `stop_all_registered`, `stop_and_wait`, `stop_proxy_inner`, `stop_registered_proxy`, `tor_client_config`, `wait_for_bootstrap`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `BootstrapWaitError`, `LiveProxy`, `PendingBootstrap`, `ProxyRegistry`, `RUNTIME`, `StopReason`, `TorProxyExit`, `TorProxyState`, `TrackedSpawner`, `TrackedTasks`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `block_on`, `blocking_io`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `deref`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `initialize`, `reenter_block_on`, `spawn_blocking`, `spawn_obj`
 // These functions are ignored (category: IgnoreBecauseOwnerTyShouldIgnore): `default`
 
 /// Start Tor client and proxy
@@ -52,8 +52,22 @@ Future<void> setDormant(
 /// Stop the Tor proxy
 ///
 /// Stops the accept loop and the client runtime that owns accepted connections.
+/// Stopping a proxy that is already stopped, or being stopped, does nothing
+/// and returns once that stop has finished.
 Future<void> stopProxy({required TorProxyHandle proxy}) =>
     RustLib.instance.api.crateApiTorStopProxy(proxy: proxy);
+
+/// Stop every Tor proxy in this process
+///
+/// Stops every proxy started in this process that hasn't been stopped yet,
+/// whichever isolate started it, including one whose isolate no longer
+/// exists, and cancels every bootstrap in flight, so nothing started before
+/// this call is left running after it. Returns how many proxies it stopped.
+///
+/// It can't tell an orphan from a live isolate's proxy: a live owner's proxy
+/// monitor reports the stop as a failure.
+Future<int> stopAllProxies() =>
+    RustLib.instance.api.crateApiTorStopAllProxies();
 
 /// Test function to verify library linking
 Future<void> hello() => RustLib.instance.api.crateApiTorHello();

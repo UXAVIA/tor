@@ -13,8 +13,8 @@ use lazy_static::lazy_static;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::runtime::{Builder, Runtime as TokioRuntime};
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -32,6 +32,7 @@ lazy_static! {
 }
 
 const PROXY_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PROCESS_WIDE_STOP_MESSAGE: &str = "Tor proxy was stopped by a process-wide stop";
 const BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 // The app sandbox already keeps other apps out of Tor's directories on phones,
 // so Arti's ownership checks add nothing there and can stop Tor starting at all.
@@ -302,8 +303,124 @@ pub struct TorProxyHandle {
 struct TorProxyState {
     accept_loop_abort: Option<AbortHandle>,
     accept_loop_monitor: Option<JoinHandle<()>>,
-    expected_stop: Arc<AtomicBool>,
+    /// 0 while running, then the [`StopReason`] of the stop that took the handles.
+    stop_reason: Arc<AtomicU8>,
     tasks: Option<TrackedTasks>,
+}
+
+/// Who stopped a proxy, as its monitor reports it.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum StopReason {
+    /// The proxy's own handle: an expected stop, which reports no failure.
+    Owner = 1,
+    /// `stop_all_proxies`, which can't tell a live isolate's proxy from an
+    /// orphan's, so a live owner hears of it as a failure and stops publishing
+    /// the port.
+    ProcessWide = 2,
+}
+
+type LiveClient = Arc<TorClient<TrackedTorRuntime>>;
+
+/// Every proxy `start_tor` has started in this process that nothing has stopped
+/// yet, and every bootstrap in flight, whichever isolate started them.
+///
+/// Dart holds clients and proxies through per-isolate handles, so an isolate
+/// can only stop what it started itself, and a proxy whose isolate has died
+/// (an engine destroyed without any Dart callback) keeps listening with no
+/// handle left anywhere. This record is how `stop_all_proxies` reaches it.
+static REGISTRY: Mutex<ProxyRegistry<LiveClient>> = Mutex::new(ProxyRegistry::new());
+
+/// Generic over the client so the bookkeeping can be tested without Arti.
+struct ProxyRegistry<C> {
+    live: Vec<LiveProxy<C>>,
+    bootstraps: Vec<(u64, CancellationToken)>,
+    next_bootstrap: u64,
+}
+
+struct LiveProxy<C> {
+    proxy: TorProxyHandle,
+    /// Holds the client until its proxy has stopped, so that when nothing else
+    /// does (its isolate is gone) the last reference is dropped by the call
+    /// that stopped it, on an FRB worker thread. Otherwise it would be dropped
+    /// inside a tokio task, and dropping the runtime the client owns from an
+    /// async context panics. Never read: only its drop matters.
+    _client: C,
+}
+
+impl<C> ProxyRegistry<C> {
+    const fn new() -> Self {
+        Self {
+            live: Vec::new(),
+            bootstraps: Vec::new(),
+            next_bootstrap: 0,
+        }
+    }
+
+    fn remove(&mut self, proxy: &TorProxyHandle) -> Option<LiveProxy<C>> {
+        let index = self
+            .live
+            .iter()
+            .position(|live| Arc::ptr_eq(&live.proxy.state, &proxy.state))?;
+        Some(self.live.swap_remove(index))
+    }
+}
+
+fn lock_registry<C>(registry: &Mutex<ProxyRegistry<C>>) -> MutexGuard<'_, ProxyRegistry<C>> {
+    // Each critical section is a single push, retain, remove or take, so a
+    // panic can't leave the record half-updated, and refusing to stop anything
+    // after one would be worse than carrying on.
+    registry.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A bootstrap in flight, which `stop_all_proxies` cancels. Deregisters on drop.
+struct PendingBootstrap<'a, C> {
+    registry: &'a Mutex<ProxyRegistry<C>>,
+    id: u64,
+    /// Cancelled by the caller's token or by a process-wide stop.
+    token: CancellationToken,
+}
+
+impl<'a, C> PendingBootstrap<'a, C> {
+    fn begin(registry: &'a Mutex<ProxyRegistry<C>>, caller: &CancellationToken) -> Self {
+        let token = caller.child_token();
+        let mut state = lock_registry(registry);
+        let id = state.next_bootstrap;
+        state.next_bootstrap += 1;
+        state.bootstraps.push((id, token.clone()));
+        drop(state);
+        Self {
+            registry,
+            id,
+            token,
+        }
+    }
+}
+
+impl<C: Clone> PendingBootstrap<'_, C> {
+    /// Records a started proxy, unless this start has been cancelled, by its
+    /// caller or by a process-wide stop; the caller must then tear it down.
+    /// Checked under the registry lock, so a process-wide stop either finds the
+    /// proxy or has cancelled its start, never neither.
+    fn publish(&self, proxy: &TorProxyHandle, client: &C) -> bool {
+        let mut state = lock_registry(self.registry);
+        if self.token.is_cancelled() {
+            return false;
+        }
+        state.live.push(LiveProxy {
+            proxy: proxy.clone(),
+            _client: client.clone(),
+        });
+        true
+    }
+}
+
+impl<C> Drop for PendingBootstrap<'_, C> {
+    fn drop(&mut self) {
+        lock_registry(self.registry)
+            .bootstraps
+            .retain(|(id, _)| *id != self.id);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -357,6 +474,7 @@ pub fn start_tor(
     cache_dir: String,
     cancellation_token: &TorBootstrapCancellationToken,
 ) -> Result<TorInstance, TorError> {
+    let pending = PendingBootstrap::begin(&REGISTRY, &cancellation_token.token);
     let cfg = tor_client_config(state_dir, cache_dir, SANDBOXED_STORAGE)?;
 
     let (runtime, tasks) =
@@ -369,7 +487,7 @@ pub fn start_tor(
                 .create_bootstrapped()
                 .await
         },
-        &cancellation_token.token,
+        &pending.token,
         BOOTSTRAP_TIMEOUT,
     ));
     let client = match client {
@@ -399,6 +517,14 @@ pub fn start_tor(
         Err(error) => return Err(finish_failed_start(tasks, error)),
     };
     let (proxy, proxy_monitor) = monitor_proxy(accept_loop, Some(tasks))?;
+    if !pending.publish(&proxy, &client) {
+        // Cancelled after the bootstrap finished: whoever cancelled it has
+        // already stopped publishing this start, so don't hand back a proxy.
+        return Err(match stop_proxy_inner(&proxy, StopReason::Owner) {
+            Ok(_) => TorError::BootstrapError("Bootstrap was cancelled".to_owned()),
+            Err(error) => error,
+        });
+    }
 
     Ok(TorInstance {
         client: TorClientWrapper { client, runtime },
@@ -492,13 +618,15 @@ fn monitor_proxy(
         }
     };
     let accept_loop_abort = accept_loop.abort_handle();
-    let expected_stop = Arc::new(AtomicBool::new(false));
-    let expected_stop_for_monitor = Arc::clone(&expected_stop);
+    let stop_reason = Arc::new(AtomicU8::new(0));
+    let stop_reason_for_monitor = Arc::clone(&stop_reason);
     let (exit_sender, exit_receiver) = watch::channel(None);
     let accept_loop_monitor = rt.spawn(async move {
         let result = accept_loop.await;
-        let expected = expected_stop_for_monitor.load(Ordering::Acquire);
+        let reason = stop_reason_for_monitor.load(Ordering::Acquire);
+        let expected = reason == StopReason::Owner as u8;
         let message = match result {
+            _ if reason == StopReason::ProcessWide as u8 => PROCESS_WIDE_STOP_MESSAGE.to_owned(),
             Ok(Ok(())) => "Tor proxy accept loop exited".to_owned(),
             Ok(Err(error)) => format!("Tor proxy accept loop failed: {error}"),
             Err(error) if error.is_cancelled() => "Tor proxy accept loop was cancelled".to_owned(),
@@ -516,7 +644,7 @@ fn monitor_proxy(
             state: Arc::new(std::sync::Mutex::new(TorProxyState {
                 accept_loop_abort: Some(accept_loop_abort),
                 accept_loop_monitor: Some(accept_loop_monitor),
-                expected_stop,
+                stop_reason,
                 tasks,
             })),
         },
@@ -546,9 +674,10 @@ pub fn bootstrap(
     client: &TorClientWrapper,
     cancellation_token: &TorBootstrapCancellationToken,
 ) -> Result<(), TorError> {
+    let pending = PendingBootstrap::begin(&REGISTRY, &cancellation_token.token);
     match client.runtime.block_on(wait_for_bootstrap(
         client.client.as_ref().bootstrap(),
-        &cancellation_token.token,
+        &pending.token,
         BOOTSTRAP_TIMEOUT,
     )) {
         Ok(()) => Ok(()),
@@ -578,21 +707,85 @@ pub fn set_dormant(client: &TorClientWrapper, soft_mode: bool) {
 /// Stop the Tor proxy
 ///
 /// Stops the accept loop and the client runtime that owns accepted connections.
+/// Stopping a proxy that is already stopped, or being stopped, does nothing
+/// and returns once that stop has finished.
 pub fn stop_proxy(proxy: TorProxyHandle) -> Result<(), TorError> {
-    let (accept_loop_abort, accept_loop_monitor, expected_stop, tasks) = {
-        let mut state = proxy
-            .state
-            .lock()
-            .map_err(|e| TorError::ProxyStopError(e.to_string()))?;
-        (
-            state.accept_loop_abort.take(),
-            state.accept_loop_monitor.take(),
-            Arc::clone(&state.expected_stop),
-            state.tasks.take(),
-        )
+    stop_registered_proxy(&REGISTRY, &proxy)
+}
+
+/// Stop every Tor proxy in this process
+///
+/// Stops every proxy started in this process that hasn't been stopped yet,
+/// whichever isolate started it, including one whose isolate no longer
+/// exists, and cancels every bootstrap in flight, so nothing started before
+/// this call is left running after it. Returns how many proxies it stopped.
+///
+/// It can't tell an orphan from a live isolate's proxy: a live owner's proxy
+/// monitor reports the stop as a failure.
+pub fn stop_all_proxies() -> Result<u32, TorError> {
+    stop_all_registered(&REGISTRY)
+}
+
+fn stop_registered_proxy<C>(
+    registry: &Mutex<ProxyRegistry<C>>,
+    proxy: &TorProxyHandle,
+) -> Result<(), TorError> {
+    let entry = lock_registry(registry).remove(proxy);
+    let result = stop_proxy_inner(proxy, StopReason::Owner).map(|_| ());
+    drop(entry);
+    result
+}
+
+fn stop_all_registered<C>(registry: &Mutex<ProxyRegistry<C>>) -> Result<u32, TorError> {
+    let live = {
+        let mut state = lock_registry(registry);
+        for (_, token) in &state.bootstraps {
+            token.cancel();
+        }
+        std::mem::take(&mut state.live)
     };
 
-    expected_stop.store(true, Ordering::Release);
+    let total = live.len();
+    let mut stopped = 0;
+    let mut errors = Vec::new();
+    for entry in live {
+        match stop_proxy_inner(&entry.proxy, StopReason::ProcessWide) {
+            Ok(true) => stopped += 1,
+            Ok(false) => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+        drop(entry);
+    }
+
+    if errors.is_empty() {
+        Ok(stopped)
+    } else {
+        Err(TorError::ProxyStopError(format!(
+            "stopped {stopped} of {total} Tor proxies cleanly: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+/// Stops the accept loop and the client tasks of `proxy`, unless another stop
+/// already has. Returns whether this call did the stopping.
+fn stop_proxy_inner(proxy: &TorProxyHandle, reason: StopReason) -> Result<bool, TorError> {
+    // Held for the whole stop, so a second stop of the same proxy (its owner's
+    // racing a process-wide one) returns only once the first has finished.
+    let mut state = proxy
+        .state
+        .lock()
+        .map_err(|e| TorError::ProxyStopError(e.to_string()))?;
+    let accept_loop_abort = state.accept_loop_abort.take();
+    let accept_loop_monitor = state.accept_loop_monitor.take();
+    let tasks = state.tasks.take();
+    let stopping = accept_loop_abort.is_some() || accept_loop_monitor.is_some() || tasks.is_some();
+    if !stopping {
+        return Ok(false);
+    }
+
+    // Before the abort, so the monitor reports why the accept loop ended.
+    state.stop_reason.store(reason as u8, Ordering::Release);
     if let Some(abort) = accept_loop_abort {
         abort.abort();
     }
@@ -614,8 +807,9 @@ pub fn stop_proxy(proxy: TorProxyHandle) -> Result<(), TorError> {
     };
 
     let task_result = tasks.map_or(Ok(()), |tasks| tasks.stop_and_wait());
+    drop(state);
 
-    accept_result.and(task_result)
+    accept_result.and(task_result).map(|()| true)
 }
 
 /// Test function to verify library linking
@@ -808,6 +1002,189 @@ mod tests {
         stop_proxy(running_proxy).unwrap();
         let stopped_exit = rt.block_on(wait_for_proxy_exit(running_monitor)).unwrap();
         assert!(stopped_exit.is_none());
+    }
+
+    fn running_proxy(tasks: Option<TrackedTasks>) -> (TorProxyHandle, TorProxyMonitor) {
+        let accept_loop = RUNTIME.as_ref().unwrap().spawn(pending::<Result<()>>());
+        monitor_proxy(accept_loop, tasks).unwrap()
+    }
+
+    fn exit_message(monitor: TorProxyMonitor) -> Option<String> {
+        RUNTIME
+            .as_ref()
+            .unwrap()
+            .block_on(wait_for_proxy_exit(monitor))
+            .unwrap()
+    }
+
+    fn register<C: Clone>(registry: &Mutex<ProxyRegistry<C>>, proxy: &TorProxyHandle, client: &C) {
+        let start = PendingBootstrap::begin(registry, &CancellationToken::new());
+        assert!(start.publish(proxy, client));
+    }
+
+    #[test]
+    fn stop_all_stops_every_registered_proxy_once() {
+        let registry = Mutex::new(ProxyRegistry::new());
+        let client = Arc::new(());
+        let (first, first_monitor) = running_proxy(None);
+        let (second, second_monitor) = running_proxy(Some(TrackedTasks::default()));
+        register(&registry, &first, &client);
+        register(&registry, &second, &client);
+        assert_eq!(Arc::strong_count(&client), 3);
+
+        assert_eq!(stop_all_registered(&registry).unwrap(), 2);
+
+        assert!(lock_registry(&registry).live.is_empty());
+        assert_eq!(Arc::strong_count(&client), 1, "a client outlived its proxy");
+        // An owner that is still alive hears of the stop as a failure.
+        for monitor in [first_monitor, second_monitor] {
+            assert_eq!(
+                exit_message(monitor).as_deref(),
+                Some(PROCESS_WIDE_STOP_MESSAGE)
+            );
+        }
+
+        // Nothing is left to stop, and the owners' own stops are no-ops.
+        assert_eq!(stop_all_registered(&registry).unwrap(), 0);
+        stop_registered_proxy(&registry, &first).unwrap();
+        assert!(!stop_proxy_inner(&second, StopReason::Owner).unwrap());
+    }
+
+    #[test]
+    fn an_owner_stop_removes_only_its_own_entry() {
+        let registry = Mutex::new(ProxyRegistry::new());
+        let (stopped, stopped_monitor) = running_proxy(None);
+        let (kept, kept_monitor) = running_proxy(None);
+        register(&registry, &stopped, &());
+        register(&registry, &kept, &());
+
+        stop_registered_proxy(&registry, &stopped).unwrap();
+
+        assert_eq!(
+            exit_message(stopped_monitor),
+            None,
+            "an owner's stop is expected"
+        );
+        {
+            let state = lock_registry(&registry);
+            assert_eq!(state.live.len(), 1);
+            assert!(Arc::ptr_eq(&state.live[0].proxy.state, &kept.state));
+        }
+        assert_eq!(stop_all_registered(&registry).unwrap(), 1);
+        assert_eq!(
+            exit_message(kept_monitor).as_deref(),
+            Some(PROCESS_WIDE_STOP_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn stop_all_cancels_bootstraps_in_flight_but_not_later_ones() {
+        let registry = Mutex::new(ProxyRegistry::new());
+        let caller = CancellationToken::new();
+        let before = PendingBootstrap::begin(&registry, &caller);
+
+        assert_eq!(stop_all_registered(&registry).unwrap(), 0);
+
+        assert!(before.token.is_cancelled());
+        assert!(
+            !caller.is_cancelled(),
+            "the caller's own token was cancelled"
+        );
+        // A start that finishes bootstrapping after the sweep can't publish.
+        let (late, late_monitor) = running_proxy(None);
+        assert!(!before.publish(&late, &()));
+        assert!(lock_registry(&registry).live.is_empty());
+        assert!(stop_proxy_inner(&late, StopReason::Owner).unwrap());
+        assert_eq!(exit_message(late_monitor), None);
+
+        let after = PendingBootstrap::begin(&registry, &CancellationToken::new());
+        assert!(!after.token.is_cancelled());
+        let (proxy, _) = running_proxy(None);
+        assert!(after.publish(&proxy, &()));
+
+        drop(before);
+        drop(after);
+        assert!(lock_registry(&registry).bootstraps.is_empty());
+        assert_eq!(stop_all_registered(&registry).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_start_its_caller_cancelled_does_not_publish() {
+        let registry = Mutex::new(ProxyRegistry::new());
+        let caller = CancellationToken::new();
+        let start = PendingBootstrap::begin(&registry, &caller);
+
+        caller.cancel();
+
+        assert!(start.token.is_cancelled());
+        let (proxy, _) = running_proxy(None);
+        assert!(!start.publish(&proxy, &()));
+        assert!(lock_registry(&registry).live.is_empty());
+        stop_proxy_inner(&proxy, StopReason::Owner).unwrap();
+    }
+
+    #[test]
+    fn stop_all_frees_a_client_no_isolate_holds_any_more() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = TorClientConfigBuilder::from_directories(state_dir.path(), cache_dir.path())
+            .build()
+            .unwrap();
+        let (runtime, tasks) = create_arti_runtime().unwrap();
+        let client = TorClient::with_runtime(runtime.clone())
+            .config(config)
+            .create_unbootstrapped()
+            .unwrap();
+        let (accept_loop, port) = start_proxy_internal(0, Arc::clone(&client)).unwrap();
+        let (proxy, _monitor) = monitor_proxy(accept_loop, Some(tasks)).unwrap();
+        let registry = Mutex::new(ProxyRegistry::new());
+        register(&registry, &proxy, &client);
+
+        // The isolate that started it has gone, and with it every handle.
+        let orphan = Arc::downgrade(&client);
+        drop((client, runtime, proxy));
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+
+        assert_eq!(stop_all_registered(&registry).unwrap(), 1);
+
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+        assert!(
+            orphan.upgrade().is_none(),
+            "the orphaned client is still alive"
+        );
+    }
+
+    #[test]
+    fn a_second_stop_returns_only_after_the_first_has_finished() {
+        let tasks = TrackedTasks::default();
+        // A task that ignores cancellation, so the first stop takes a while.
+        RUNTIME
+            .as_ref()
+            .unwrap()
+            .spawn(tasks.tracker.track_future(async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }));
+        let (proxy, _) = running_proxy(Some(tasks.clone()));
+        let registry = Mutex::new(ProxyRegistry::new());
+        register(&registry, &proxy, &());
+
+        let (first_finished, second_returned) = thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let stopped = stop_all_registered(&registry).unwrap();
+                (stopped, Instant::now())
+            });
+            while !tasks.cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            // The first stop now holds the proxy and is waiting for its tasks.
+            stop_registered_proxy(&registry, &proxy).unwrap();
+            let second_returned = Instant::now();
+            let (stopped, first_finished) = first.join().unwrap();
+            assert_eq!(stopped, 1);
+            (first_finished, second_returned)
+        });
+
+        assert!(second_returned >= first_finished);
     }
 
     #[cfg(unix)]
