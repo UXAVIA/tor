@@ -137,10 +137,13 @@ class Tor {
   /// had begun running; a call still queued for a native worker thread isn't
   /// covered.
   ///
-  /// Throws a [TorError] (`TorError.proxyStopError`) when some proxy failed to
-  /// stop or something it waited for was still running. Every proxy has
-  /// still been asked to stop, so there is nothing to retry, but the
-  /// guarantee above may not hold.
+  /// Every step is bounded, so it returns within about 15 seconds per proxy
+  /// plus that 15-second wait. Throws a [TorError]
+  /// (`TorError.proxyStopError`) when some proxy failed to stop or to release
+  /// its client in time, or something it waited for was still running. Every
+  /// proxy has still been asked to stop, and a client that couldn't be
+  /// released in time is released once it can, so there is nothing to retry,
+  /// but the guarantee above may not hold until then.
   ///
   /// The native side can't tell an orphan from a live isolate's proxy, so it
   /// stops those too. A live isolate, this one included, sees its proxy's
@@ -401,9 +404,9 @@ class Tor {
     // would lose the stop and leave the proxy listening with no handle left.
     // The call reaches the native worker before this method returns. It ends
     // the accept loop and the client's tasks and releases the client itself;
-    // a bootstrap in flight keeps its own reference until it ends, and a
-    // dormant call in flight holds the stop off until it returns. The dispose
-    // below only drops this isolate's wrapper, after those calls.
+    // a bootstrap in flight is ended by it and gives the client back first,
+    // and a dormant call in flight holds the release off until it returns.
+    // The dispose below only drops this isolate's wrapper, after those calls.
     final nativeStop =
         proxy == null ? null : Future.sync(() => rust.stopProxy(proxy: proxy));
 

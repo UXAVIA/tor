@@ -8,10 +8,10 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'tor.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `begin`, `bootstrap_with`, `bootstrap`, `client`, `create_arti_runtime`, `error_chain`, `finish_failed_start`, `lock_unpoisoned`, `lock`, `monitor_proxy`, `new`, `new`, `publish_started`, `publish`, `release_client`, `start_proxy_internal`, `start_tor_with`, `stop_all_registered`, `stop_and_wait`, `stop_error_detail`, `stop_proxy_inner`, `stop_registered_proxy`, `stop`, `tor_client_config`, `wait_for_bootstrap`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `BootstrapWaitError`, `InFlight`, `RUNTIME`, `RegistryState`, `Registry`, `StopReason`, `TorProxyExit`, `TorProxyState`, `TrackedSpawner`, `TrackedTasks`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `block_on`, `blocking_io`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `deref`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `initialize`, `reenter_block_on`, `spawn_blocking`, `spawn_obj`
-// These functions are ignored (category: IgnoreBecauseOwnerTyShouldIgnore): `default`
+// These functions are ignored because they are not marked as `pub`: `begin`, `bootstrap_with`, `bootstrap`, `borrow`, `create_arti_runtime`, `error_chain`, `finish_failed_start`, `lock_unpoisoned`, `lock`, `mark_unclean`, `monitor_proxy`, `new`, `new`, `new`, `publish_started`, `publish`, `release`, `start_proxy_internal`, `start_tor_with`, `stop_all_registered`, `stop_and_wait`, `stop_error_detail`, `stop_proxy_inner`, `stop_registered_proxy`, `stop`, `tor_client_config`, `wait_for_bootstrap`, `wait_for_borrowers`, `wait`, `wait`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `BootstrapWaitError`, `Borrowed`, `ClientCellState`, `ClientCell`, `Drain`, `FinishStop`, `InFlight`, `RUNTIME`, `RegistryState`, `Registry`, `StopDone`, `StopReason`, `TorProxyExit`, `TorProxyState`, `TrackedSpawner`, `TrackedTasks`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `block_on`, `blocking_io`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `deref`, `drop`, `drop`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `initialize`, `reenter_block_on`, `spawn_blocking`, `spawn_obj`
+// These functions are ignored (category: IgnoreBecauseOwnerTyShouldIgnore): `default`, `default`, `default`
 
 /// Start Tor client and proxy
 ///
@@ -60,7 +60,12 @@ Future<void> setDormant(
 /// Stops the accept loop and the client runtime that owns accepted
 /// connections, and releases the client. Stopping a proxy that is already
 /// stopped, or being stopped, does nothing and returns once that stop has
-/// finished.
+/// finished, with an error if it failed.
+///
+/// Each step is bounded: 5 seconds for the accept loop, 5 for the client's
+/// tasks and 5 for dropping the client, which waits for the client runtime's
+/// blocking tasks. A client that takes longer is still dropped once it can,
+/// but this returns an error saying Arti's locks may still be held.
 Future<void> stopProxy({required TorProxyHandle proxy}) =>
     RustLib.instance.api.crateApiTorStopProxy(proxy: proxy);
 
@@ -76,7 +81,10 @@ Future<void> stopProxy({required TorProxyHandle proxy}) =>
 /// Returns how many proxies it stopped. Once it has returned `Ok`, nothing
 /// started before it still holds a SOCKS listener or a client, so Arti's
 /// state and cache locks are free. An error means that may not hold: a proxy
-/// failed to stop, or something it waited for was still running.
+/// failed to stop or to release its client in time, or something it waited
+/// for was still running. Each proxy takes at most about 15 seconds to stop
+/// (see `stop_proxy`), so a sweep returns within that per proxy plus the
+/// 15-second wait.
 ///
 /// It can't tell an orphan from a live isolate's proxy: a live owner's proxy
 /// monitor reports the stop as a loss with `process_wide_stop` set.

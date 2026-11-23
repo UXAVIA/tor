@@ -9,7 +9,8 @@ SPDX-License-Identifier: MIT
 * Added `Tor.stopAllInProcess()`, which stops every Tor proxy in the process, including one whose isolate died without stopping it, cancels every start and bootstrap in flight, and waits for them to end.
 * Added `TorProxyFailure.processWideStop`, set when `Tor.stopAllInProcess()` caused the failure. The generated `waitForProxyExit` now returns a `TorProxyLoss` instead of a message.
 * `Tor.stop()` issues the native stop of the published proxy at once instead of queueing it behind a bootstrap or dormant call in flight. The client is still disposed after them.
-* Stopping a proxy now also releases its native client, even if a Dart wrapper is never disposed. A native `bootstrap` of that client then fails with `ClientNotInitialized`, and `setDormant` does nothing.
+* Stopping a proxy now also releases its native client, even if a Dart wrapper is never disposed. A native `bootstrap` of that client then fails with `ClientNotInitialized`, and `setDormant` does nothing. A bootstrap already running on it ends with the stop.
+* The client is dropped on a release thread. A stop waits up to 5 seconds for that and otherwise fails with a timeout, while the drop carries on. A client whose tasks didn't stop in time is dropped once they end, so Arti's locks come back.
 * A start cancelled after its bootstrap finished now fails natively with a cancelled-bootstrap error, instead of returning a proxy for Dart to tear down.
 * A stop of a proxy that another stop is already stopping now waits for that stop to finish.
 * The Android build no longer pins its own Android Gradle Plugin on a buildscript classpath; the app's is used, as it already was. The plugin's `android/` directory therefore can't be synced on its own, outside an app.

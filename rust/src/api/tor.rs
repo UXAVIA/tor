@@ -10,6 +10,7 @@ use flutter_rust_bridge::frb;
 use futures::future::FutureObj;
 use futures::task::{Spawn, SpawnError};
 use lazy_static::lazy_static;
+use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -35,6 +36,8 @@ const PROXY_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const PROCESS_WIDE_STOP_MESSAGE: &str = "Tor proxy was stopped by a process-wide stop";
 /// How long a sweep waits for the starts, re-bootstraps and stops it found running.
 const SWEEP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a stop waits for its client to be dropped.
+const CLIENT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 // The app sandbox already keeps other apps out of Tor's directories on phones,
 // so Arti's ownership checks add nothing there and can stop Tor starting at all.
@@ -186,20 +189,34 @@ where
     }
 }
 
-fn finish_failed_start(
+/// Stops the tasks of a start that failed and releases what it built. With
+/// `pending`, a cleanup that fails is reported to a sweep waiting for it.
+fn finish_failed_start<T: Send + 'static>(
+    pending: Option<&InFlight<'_>>,
     tasks: TrackedTasks,
     error: TorError,
-    client: Option<OwnedClient>,
+    leftover: T,
 ) -> TorError {
-    let cleanup = tasks.stop_and_wait();
-    if let Some(client) = client {
-        release_client(client, cleanup.is_ok());
-    }
-    match cleanup {
+    let stopped = tasks.stop_and_wait();
+    let drain = Drain {
+        tasks: stopped.is_err().then(|| tasks.tracker.clone()),
+        ..Drain::default()
+    };
+    let released = release(
+        leftover,
+        drain,
+        stopped.is_ok().then_some(CLIENT_RELEASE_TIMEOUT),
+    );
+    match stopped.and(released) {
         Ok(()) => error,
-        Err(cleanup_error) => TorError::RuntimeError(format!(
-            "{error}; failed to stop partially started Tor tasks: {cleanup_error}"
-        )),
+        Err(cleanup_error) => {
+            if let Some(pending) = pending {
+                pending.mark_unclean();
+            }
+            TorError::RuntimeError(format!(
+                "{error}; failed to clean up the partially started Tor client: {cleanup_error}"
+            ))
+        }
     }
 }
 
@@ -291,23 +308,82 @@ impl TorBootstrapCancellationToken {
 type LiveClient = Arc<TorClient<TrackedTorRuntime>>;
 /// A client and the runtime that drives it.
 type OwnedClient = (LiveClient, TrackedTorRuntime);
+type ClientSlot = Arc<ClientCell>;
+
 /// Where a started client lives. Stopping its proxy empties it, so a Dart
 /// wrapper, which reaches the client only through it, can't keep a stopped
 /// client (and with it Arti's directory and state locks) alive, even when the
 /// wrapper is never disposed: a start whose result reached a dead isolate, say.
-type ClientSlot = Arc<Mutex<Option<OwnedClient>>>;
+struct ClientCell {
+    state: Mutex<ClientCellState>,
+    /// Notified when a bootstrap gives the client back.
+    returned: Condvar,
+    /// Cancelled when the client's proxy stops, which ends any bootstrap that
+    /// has borrowed it.
+    stopped: CancellationToken,
+}
+
+struct ClientCellState {
+    client: Option<OwnedClient>,
+    /// Bootstraps holding a clone of the client.
+    borrowers: usize,
+}
+
+impl ClientCell {
+    fn new(client: OwnedClient) -> ClientSlot {
+        Arc::new(Self {
+            state: Mutex::new(ClientCellState {
+                client: Some(client),
+                borrowers: 0,
+            }),
+            returned: Condvar::new(),
+            stopped: CancellationToken::new(),
+        })
+    }
+
+    /// Lends the client until the guard drops, unless its proxy is stopping.
+    fn borrow(self: &Arc<Self>) -> Option<Borrowed> {
+        let mut state = lock_unpoisoned(&self.state);
+        if self.stopped.is_cancelled() {
+            return None;
+        }
+        let client = state.client.clone()?;
+        state.borrowers += 1;
+        Some(Borrowed {
+            cell: Arc::clone(self),
+            client: Some(client),
+        })
+    }
+
+    fn wait_for_borrowers(&self) {
+        let state = lock_unpoisoned(&self.state);
+        drop(
+            self.returned
+                .wait_while(state, |state| state.borrowers > 0)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+}
+
+/// A client lent to a bootstrap. It drops its clone before giving the client
+/// back, so the stop that released the client always drops the last one.
+struct Borrowed {
+    cell: ClientSlot,
+    client: Option<OwnedClient>,
+}
+
+impl Drop for Borrowed {
+    fn drop(&mut self) {
+        drop(self.client.take());
+        lock_unpoisoned(&self.cell.state).borrowers -= 1;
+        self.cell.returned.notify_all();
+    }
+}
 
 /// Opaque wrapper for TorClient - FRB handles this automatically
 #[frb(opaque)]
 pub struct TorClientWrapper {
     slot: ClientSlot,
-}
-
-impl TorClientWrapper {
-    /// The client and its runtime, unless its proxy has stopped.
-    fn client(&self) -> Option<OwnedClient> {
-        lock_unpoisoned(&self.slot).clone()
-    }
 }
 
 impl Clone for TorClientWrapper {
@@ -332,6 +408,8 @@ struct TorProxyState {
     tasks: Option<TrackedTasks>,
     /// The client this proxy serves, released when it stops.
     client: Option<ClientSlot>,
+    /// Set by the stop that took the handles, for any later stop to wait on.
+    stopping: Option<Arc<StopDone>>,
 }
 
 /// Who stopped a proxy, as its monitor reports it.
@@ -346,6 +424,39 @@ enum StopReason {
     ProcessWide = 2,
 }
 
+/// The end of a proxy's stop: whether it stopped and released everything.
+#[derive(Default)]
+#[frb(ignore)]
+struct StopDone {
+    clean: Mutex<Option<bool>>,
+    ended: Condvar,
+}
+
+impl StopDone {
+    /// Waits for the stop to end. True when it stopped and released everything.
+    fn wait(&self) -> bool {
+        let clean = self
+            .ended
+            .wait_while(lock_unpoisoned(&self.clean), |clean| clean.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        clean.unwrap_or(false)
+    }
+}
+
+/// Ends a stop on drop, as unclean unless told otherwise, so a stop that
+/// panics can't leave a later stop waiting for ever.
+struct FinishStop {
+    done: Arc<StopDone>,
+    clean: bool,
+}
+
+impl Drop for FinishStop {
+    fn drop(&mut self) {
+        *lock_unpoisoned(&self.done.clean) = Some(self.clean);
+        self.done.ended.notify_all();
+    }
+}
+
 // Every critical section on these locks leaves its data whole (an `Option`
 // taken or not, an entry pushed or not), so a panic elsewhere is no reason to
 // refuse to stop anything afterwards.
@@ -353,19 +464,80 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Clients whose proxy failed to stop, kept for the life of the process. Their
-/// tasks may still hold references, and if one of those were the last, the
-/// runtime the client owns would be dropped inside a tokio worker, which panics.
-static ZOMBIES: Mutex<Vec<OwnedClient>> = Mutex::new(Vec::new());
+/// What has to end before a released client, or runtime, may be dropped.
+#[derive(Default)]
+#[frb(ignore)]
+struct Drain {
+    /// Bootstraps that borrowed the client give it back.
+    borrowers: Option<ClientSlot>,
+    /// An accept loop that didn't stop in time.
+    accept_loop: Option<JoinHandle<()>>,
+    /// Client tasks that didn't stop in time.
+    tasks: Option<TaskTracker>,
+}
 
-/// Drops a client whose tasks have all stopped, here, on the calling FRB
-/// worker thread, and keeps one whose tasks may still be running.
-fn release_client(client: OwnedClient, tasks_stopped: bool) {
-    if tasks_stopped {
-        drop(client);
-    } else {
-        lock_unpoisoned(&ZOMBIES).push(client);
+impl Drain {
+    /// Waits, with no time limit, for everything that could still hold a
+    /// reference. Runs on a release thread.
+    fn wait(self) {
+        let Drain {
+            borrowers,
+            accept_loop,
+            tasks,
+        } = self;
+        if accept_loop.is_some() || tasks.is_some() {
+            if let Ok(rt) = RUNTIME.as_ref() {
+                rt.block_on(async {
+                    if let Some(accept_loop) = accept_loop {
+                        let _ = accept_loop.await;
+                    }
+                    if let Some(tasks) = tasks {
+                        tasks.wait().await;
+                    }
+                });
+            }
+        }
+        if let Some(cell) = borrowers {
+            cell.wait_for_borrowers();
+        }
     }
+}
+
+/// Drops `value` on its own thread once `drain` has finished. Dropping a
+/// client's last reference drops its tokio runtime, which waits for that
+/// runtime's blocking tasks with no time limit, and doing it inside a tokio
+/// worker panics; neither may hold up a stop for good. With `wait`, waits that
+/// long for the drop; without, returns at once and the drop happens whenever
+/// the drain ends.
+fn release<T: Send + 'static>(
+    value: T,
+    drain: Drain,
+    wait: Option<std::time::Duration>,
+) -> Result<(), TorError> {
+    let (sender, released) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("tor-client-release".to_owned())
+        .spawn(move || {
+            drain.wait();
+            drop(value);
+            let _ = sender.send(());
+        })
+        .map_err(|error| {
+            TorError::RuntimeError(format!("Couldn't start releasing the Tor client: {error}"))
+        })?;
+    let Some(wait) = wait else {
+        return Ok(());
+    };
+    released.recv_timeout(wait).map_err(|error| {
+        TorError::ProxyStopError(match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                "Timed out releasing the Tor client; Arti's locks may still be held".to_owned()
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                "Releasing the Tor client failed; Arti's locks may still be held".to_owned()
+            }
+        })
+    })
 }
 
 /// Every proxy `start_tor` has published in this process that nothing has
@@ -384,11 +556,17 @@ struct Registry {
     ended: Condvar,
 }
 
+/// How many entries that ended unclean the registry remembers for sweeps.
+const UNCLEAN_KEPT: usize = 64;
+
 struct RegistryState {
     live: Vec<TorProxyHandle>,
     /// A sweep cancels these tokens, which only bootstraps watch, and waits
     /// for every entry it saw to end.
     in_flight: Vec<(u64, CancellationToken)>,
+    /// In-flight entries that ended without releasing everything in time, so
+    /// a sweep that waited for them can say so.
+    unclean: Vec<u64>,
     next_id: u64,
 }
 
@@ -398,6 +576,7 @@ impl Registry {
             state: Mutex::new(RegistryState {
                 live: Vec::new(),
                 in_flight: Vec::new(),
+                unclean: Vec::new(),
                 next_id: 0,
             }),
             ended: Condvar::new(),
@@ -415,6 +594,7 @@ struct InFlight<'a> {
     id: u64,
     /// Cancelled by the caller's token or by a sweep.
     token: CancellationToken,
+    unclean: Cell<bool>,
 }
 
 impl<'a> InFlight<'a> {
@@ -438,6 +618,7 @@ impl<'a> InFlight<'a> {
             registry,
             id,
             token,
+            unclean: Cell::new(false),
         }
     }
 
@@ -453,14 +634,25 @@ impl<'a> InFlight<'a> {
         state.live.push(proxy.clone());
         true
     }
+
+    /// Reports, to a sweep waiting for this entry, that it ended without
+    /// releasing everything in time.
+    fn mark_unclean(&self) {
+        self.unclean.set(true);
+    }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.registry
-            .lock()
-            .in_flight
-            .retain(|(id, _)| *id != self.id);
+        let mut state = self.registry.lock();
+        state.in_flight.retain(|(id, _)| *id != self.id);
+        if self.unclean.get() {
+            if state.unclean.len() == UNCLEAN_KEPT {
+                state.unclean.remove(0);
+            }
+            state.unclean.push(self.id);
+        }
+        drop(state);
         self.registry.ended.notify_all();
     }
 }
@@ -564,23 +756,26 @@ where
         Ok(client) => client,
         Err(BootstrapWaitError::Cancelled) => {
             return Err(finish_failed_start(
+                Some(&pending),
                 tasks,
                 TorError::BootstrapError("Bootstrap was cancelled".to_owned()),
-                None,
+                runtime,
             ));
         }
         Err(BootstrapWaitError::TimedOut) => {
             return Err(finish_failed_start(
+                Some(&pending),
                 tasks,
                 TorError::BootstrapError("Bootstrap timed out".to_owned()),
-                None,
+                runtime,
             ));
         }
         Err(BootstrapWaitError::Failed(error)) => {
             return Err(finish_failed_start(
+                Some(&pending),
                 tasks,
                 TorError::BootstrapError(error_chain(&error)),
-                None,
+                runtime,
             ));
         }
     };
@@ -599,17 +794,26 @@ fn publish_started(
 ) -> Result<TorInstance, TorError> {
     let (accept_loop, socks_port) = match start_proxy_internal(socks_port, Arc::clone(&client)) {
         Ok(proxy) => proxy,
-        Err(error) => return Err(finish_failed_start(tasks, error, Some((client, runtime)))),
+        Err(error) => {
+            return Err(finish_failed_start(
+                Some(pending),
+                tasks,
+                error,
+                (client, runtime),
+            ))
+        }
     };
-    let (proxy, proxy_monitor) = monitor_proxy(accept_loop, Some(tasks))?;
-    let slot: ClientSlot = Arc::new(Mutex::new(Some((client, runtime))));
-    lock_unpoisoned(&proxy.state).client = Some(Arc::clone(&slot));
+    let slot = ClientCell::new((client, runtime));
+    let (proxy, proxy_monitor) = monitor_proxy(accept_loop, Some(tasks), Some(Arc::clone(&slot)))?;
     if !pending.publish(&proxy) {
         // Cancelled after the bootstrap finished: whoever cancelled it has
         // already stopped publishing this start, so don't hand back a proxy.
         return Err(match stop_proxy_inner(&proxy, StopReason::Owner) {
             Ok(_) => TorError::BootstrapError("Bootstrap was cancelled".to_owned()),
-            Err(error) => error,
+            Err(error) => {
+                pending.mark_unclean();
+                error
+            }
         });
     }
 
@@ -692,14 +896,16 @@ fn start_proxy_internal(
 fn monitor_proxy(
     accept_loop: JoinHandle<Result<()>>,
     tasks: Option<TrackedTasks>,
+    client: Option<ClientSlot>,
 ) -> Result<(TorProxyHandle, TorProxyMonitor), TorError> {
     let rt = match RUNTIME.as_ref() {
         Ok(rt) => rt,
         Err(error) => {
             accept_loop.abort();
             let error = TorError::RuntimeError(error.to_string());
+            let leftover = client.and_then(|cell| lock_unpoisoned(&cell.state).client.take());
             return Err(match tasks {
-                Some(tasks) => finish_failed_start(tasks, error, None),
+                Some(tasks) => finish_failed_start(None, tasks, error, leftover),
                 None => error,
             });
         }
@@ -737,7 +943,8 @@ fn monitor_proxy(
                 accept_loop_monitor: Some(accept_loop_monitor),
                 stop_reason,
                 tasks,
-                client: None,
+                client,
+                stopping: None,
             })),
         },
         TorProxyMonitor {
@@ -792,23 +999,43 @@ where
     Fut: Future<Output = std::result::Result<(), E>>,
     E: std::fmt::Display,
 {
-    // The first local, so it is dropped last, after the client clone below: a
-    // sweep waits for this bootstrap to end and expects the client released.
+    // The first local, so it is dropped last, after the client is given back:
+    // a sweep waits for this bootstrap to end.
     let pending = InFlight::bootstrap(registry, caller);
-    let (client, runtime) = wrapper.client().ok_or(TorError::ClientNotInitialized)?;
+    let borrowed = wrapper
+        .slot
+        .borrow()
+        .ok_or(TorError::ClientNotInitialized)?;
+    let (client, runtime) = borrowed
+        .client
+        .as_ref()
+        .ok_or(TorError::ClientNotInitialized)?;
+    // A stop of the client's proxy ends the bootstrap as well, so it can't keep
+    // the client, and Arti's locks, past that stop.
+    let stopped = borrowed.cell.stopped.clone();
+    let bootstrap = bootstrap(Arc::clone(client));
+    let until_stopped = async move {
+        tokio::select! {
+            biased;
+            _ = stopped.cancelled() => Err(None),
+            result = bootstrap => result.map_err(Some),
+        }
+    };
     match runtime.block_on(wait_for_bootstrap(
-        bootstrap(client),
+        until_stopped,
         &pending.token,
         BOOTSTRAP_TIMEOUT,
     )) {
         Ok(()) => Ok(()),
-        Err(BootstrapWaitError::Cancelled) => Err(TorError::BootstrapError(
-            "Bootstrap was cancelled".to_owned(),
-        )),
+        Err(BootstrapWaitError::Cancelled) | Err(BootstrapWaitError::Failed(None)) => Err(
+            TorError::BootstrapError("Bootstrap was cancelled".to_owned()),
+        ),
         Err(BootstrapWaitError::TimedOut) => {
             Err(TorError::BootstrapError("Bootstrap timed out".to_owned()))
         }
-        Err(BootstrapWaitError::Failed(error)) => Err(TorError::BootstrapError(error.to_string())),
+        Err(BootstrapWaitError::Failed(Some(error))) => {
+            Err(TorError::BootstrapError(error.to_string()))
+        }
     }
 }
 
@@ -824,8 +1051,8 @@ pub fn set_dormant(client: &TorClientWrapper, soft_mode: bool) {
     } else {
         DormantMode::Normal
     };
-    // Under the slot's lock, so a stop can't release the client meanwhile.
-    if let Some((client, _)) = lock_unpoisoned(&client.slot).as_ref() {
+    // Under the cell's lock, so a stop can't release the client meanwhile.
+    if let Some((client, _)) = lock_unpoisoned(&client.slot.state).client.as_ref() {
         client.set_dormant(dormant_mode);
     }
 }
@@ -835,7 +1062,12 @@ pub fn set_dormant(client: &TorClientWrapper, soft_mode: bool) {
 /// Stops the accept loop and the client runtime that owns accepted
 /// connections, and releases the client. Stopping a proxy that is already
 /// stopped, or being stopped, does nothing and returns once that stop has
-/// finished.
+/// finished, with an error if it failed.
+///
+/// Each step is bounded: 5 seconds for the accept loop, 5 for the client's
+/// tasks and 5 for dropping the client, which waits for the client runtime's
+/// blocking tasks. A client that takes longer is still dropped once it can,
+/// but this returns an error saying Arti's locks may still be held.
 pub fn stop_proxy(proxy: TorProxyHandle) -> Result<(), TorError> {
     stop_registered_proxy(&REGISTRY, &proxy)
 }
@@ -852,7 +1084,10 @@ pub fn stop_proxy(proxy: TorProxyHandle) -> Result<(), TorError> {
 /// Returns how many proxies it stopped. Once it has returned `Ok`, nothing
 /// started before it still holds a SOCKS listener or a client, so Arti's
 /// state and cache locks are free. An error means that may not hold: a proxy
-/// failed to stop, or something it waited for was still running.
+/// failed to stop or to release its client in time, or something it waited
+/// for was still running. Each proxy takes at most about 15 seconds to stop
+/// (see `stop_proxy`), so a sweep returns within that per proxy plus the
+/// 15-second wait.
 ///
 /// It can't tell an orphan from a live isolate's proxy: a live owner's proxy
 /// monitor reports the stop as a loss with `process_wide_stop` set.
@@ -871,6 +1106,9 @@ fn stop_registered_proxy(registry: &Registry, proxy: &TorProxyHandle) -> Result<
         .lock()
         .live
         .retain(|live| !Arc::ptr_eq(&live.state, &proxy.state));
+    if result.is_err() {
+        _in_flight.mark_unclean();
+    }
     result.map(|_| ())
 }
 
@@ -906,6 +1144,12 @@ fn stop_all_registered(registry: &Registry, wait: std::time::Duration) -> Result
         .wait_timeout_while(registry.lock(), wait, waiting)
         .unwrap_or_else(PoisonError::into_inner);
     let still_running = waiting(&mut state);
+    let ended_unclean = state
+        .unclean
+        .iter()
+        .filter(|id| waiting_for.contains(id))
+        .count();
+    state.unclean.retain(|id| !waiting_for.contains(id));
     drop(state);
 
     let mut problems = Vec::new();
@@ -914,6 +1158,12 @@ fn stop_all_registered(registry: &Registry, wait: std::time::Duration) -> Result
         problems.push(format!(
             "stopped {stopped} of {attempted} Tor proxies cleanly: {}",
             failures.join("; ")
+        ));
+    }
+    if ended_unclean > 0 {
+        problems.push(format!(
+            "{ended_unclean} Tor start(s) or stop(s) begun before this one couldn't \
+             release their client in time, so Arti's locks may still be held"
         ));
     }
     if still_running {
@@ -941,14 +1191,11 @@ fn stop_error_detail(error: &TorError) -> String {
 
 /// Stops the accept loop and the client tasks of `proxy` and releases its
 /// client, unless another stop already has. Returns whether this call did the
-/// stopping.
+/// stopping; a later stop returns only once the earlier one has ended.
 fn stop_proxy_inner(proxy: &TorProxyHandle, reason: StopReason) -> Result<bool, TorError> {
-    // Held for the whole stop, client release included, so a second stop of
-    // the same proxy (its owner's racing a process-wide one) returns only once
-    // the first has finished.
     let mut state = lock_unpoisoned(&proxy.state);
     let accept_loop_abort = state.accept_loop_abort.take();
-    let accept_loop_monitor = state.accept_loop_monitor.take();
+    let mut accept_loop_monitor = state.accept_loop_monitor.take();
     let tasks = state.tasks.take();
     let client = state.client.take();
     if accept_loop_abort.is_none()
@@ -956,16 +1203,33 @@ fn stop_proxy_inner(proxy: &TorProxyHandle, reason: StopReason) -> Result<bool, 
         && tasks.is_none()
         && client.is_none()
     {
-        return Ok(false);
+        let earlier = state.stopping.clone();
+        drop(state);
+        return match earlier.is_none_or(|done| done.wait()) {
+            true => Ok(false),
+            false => Err(TorError::ProxyStopError(
+                "Another stop of this Tor proxy failed; Arti's locks may still be held".to_owned(),
+            )),
+        };
     }
-
     // Before the abort, so the monitor reports why the accept loop ended.
     state.stop_reason.store(reason as u8, Ordering::Release);
+    let mut finish = FinishStop {
+        done: Arc::new(StopDone::default()),
+        clean: false,
+    };
+    state.stopping = Some(Arc::clone(&finish.done));
+    drop(state);
+
+    // Ends a bootstrap that has borrowed the client, so it gives it back.
+    if let Some(cell) = &client {
+        cell.stopped.cancel();
+    }
     if let Some(abort) = accept_loop_abort {
         abort.abort();
     }
 
-    let accept_result = match (accept_loop_monitor, RUNTIME.as_ref()) {
+    let accept_result = match (accept_loop_monitor.as_mut(), RUNTIME.as_ref()) {
         (Some(monitor), Ok(rt)) => rt.block_on(async {
             match tokio::time::timeout(PROXY_SHUTDOWN_TIMEOUT, monitor).await {
                 Err(_) => Err(TorError::ProxyStopError(
@@ -980,14 +1244,36 @@ fn stop_proxy_inner(proxy: &TorProxyHandle, reason: StopReason) -> Result<bool, 
         (Some(_), Err(error)) => Err(TorError::RuntimeError(error.to_string())),
         (None, _) => Ok(()),
     };
-
-    let task_result = tasks.map_or(Ok(()), |tasks| tasks.stop_and_wait());
-    let result = accept_result.and(task_result);
-    if let Some(client) = client.and_then(|slot| lock_unpoisoned(&slot).take()) {
-        release_client(client, result.is_ok());
+    if accept_result.is_ok() {
+        accept_loop_monitor = None;
     }
-    drop(state);
+    let task_result = tasks.as_ref().map_or(Ok(()), TrackedTasks::stop_and_wait);
+    let still_running = task_result
+        .is_err()
+        .then(|| tasks.as_ref().map(|tasks| tasks.tracker.clone()))
+        .flatten();
+    let stopped = accept_result.and(task_result);
 
+    // A client whose tasks stopped is dropped within the bound; one whose
+    // tasks may still be running is dropped once they end, however long that
+    // takes, and this stop has already failed.
+    let owned = client
+        .as_ref()
+        .and_then(|cell| lock_unpoisoned(&cell.state).client.take());
+    let released = match owned {
+        None => Ok(()),
+        Some(owned) => release(
+            owned,
+            Drain {
+                borrowers: client,
+                accept_loop: accept_loop_monitor,
+                tasks: still_running,
+            },
+            stopped.is_ok().then_some(CLIENT_RELEASE_TIMEOUT),
+        ),
+    };
+    let result = stopped.and(released);
+    finish.clean = result.is_ok();
     result.map(|()| true)
 }
 
@@ -1051,7 +1337,7 @@ mod tests {
             "the published SOCKS port was not retained by the proxy"
         );
 
-        let (proxy, _) = monitor_proxy(proxy_task, Some(tasks)).unwrap();
+        let (proxy, _) = monitor_proxy(proxy_task, Some(tasks), None).unwrap();
         stop_proxy(proxy).unwrap();
 
         TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -1122,7 +1408,7 @@ mod tests {
             "the idle connection was not accepted"
         );
 
-        let (proxy, _) = monitor_proxy(proxy_task, Some(tasks)).unwrap();
+        let (proxy, _) = monitor_proxy(proxy_task, Some(tasks), None).unwrap();
         stop_proxy(proxy).unwrap();
 
         assert_eq!(Arc::strong_count(&client), baseline_client_references);
@@ -1144,7 +1430,7 @@ mod tests {
 
         // A proxy that already died is exactly when the caller has to be able
         // to restart, so a stale accept-loop error must not fail teardown.
-        let (proxy, _) = monitor_proxy(accept_loop, None).unwrap();
+        let (proxy, _) = monitor_proxy(accept_loop, None, None).unwrap();
         stop_proxy(proxy).unwrap();
     }
 
@@ -1175,7 +1461,7 @@ mod tests {
         let _global = global_registry();
         let rt = RUNTIME.as_ref().unwrap();
         let failed_loop = rt.spawn(async { Err(anyhow::anyhow!("fatal accept error")) });
-        let (failed_proxy, failed_monitor) = monitor_proxy(failed_loop, None).unwrap();
+        let (failed_proxy, failed_monitor) = monitor_proxy(failed_loop, None, None).unwrap();
         let failed_exit = rt.block_on(wait_for_proxy_exit(failed_monitor)).unwrap();
         let loss = failed_exit.unwrap();
         assert!(loss.message.contains("fatal accept error"));
@@ -1183,7 +1469,7 @@ mod tests {
         stop_proxy(failed_proxy).unwrap();
 
         let running_loop = rt.spawn(pending::<Result<()>>());
-        let (running_proxy, running_monitor) = monitor_proxy(running_loop, None).unwrap();
+        let (running_proxy, running_monitor) = monitor_proxy(running_loop, None, None).unwrap();
         stop_proxy(running_proxy).unwrap();
         let stopped_exit = rt.block_on(wait_for_proxy_exit(running_monitor)).unwrap();
         assert!(stopped_exit.is_none());
@@ -1203,7 +1489,7 @@ mod tests {
 
     fn running_proxy(tasks: Option<TrackedTasks>) -> (TorProxyHandle, TorProxyMonitor) {
         let accept_loop = RUNTIME.as_ref().unwrap().spawn(pending::<Result<()>>());
-        monitor_proxy(accept_loop, tasks).unwrap()
+        monitor_proxy(accept_loop, tasks, None).unwrap()
     }
 
     fn exit_loss(monitor: TorProxyMonitor) -> Option<TorProxyLoss> {
@@ -1258,8 +1544,46 @@ mod tests {
         }
     }
 
-    fn client_of(wrapper: &TorClientWrapper) -> std::sync::Weak<TorClient<TrackedTorRuntime>> {
-        Arc::downgrade(&wrapper.client().expect("the client was already released").0)
+    type WeakClient = std::sync::Weak<TorClient<TrackedTorRuntime>>;
+
+    fn client_of(wrapper: &TorClientWrapper) -> WeakClient {
+        let state = lock_unpoisoned(&wrapper.slot.state);
+        let (client, _) = state
+            .client
+            .as_ref()
+            .expect("the client was already released");
+        Arc::downgrade(client)
+    }
+
+    fn is_released(wrapper: &TorClientWrapper) -> bool {
+        lock_unpoisoned(&wrapper.slot.state).client.is_none()
+    }
+
+    /// A proxy serving a real offline client, and a weak reference to it.
+    fn proxy_with_client(
+        dirs: &OfflineDirs,
+        tasks: Option<TrackedTasks>,
+        stuck_blocking_task: Option<Duration>,
+    ) -> (TorProxyHandle, TorClientWrapper, WeakClient) {
+        let (runtime, _) = create_arti_runtime().unwrap();
+        let client = dirs.client(runtime.clone()).unwrap();
+        if let Some(stuck) = stuck_blocking_task {
+            // Its runtime's drop waits for this, however long it takes.
+            drop(runtime.spawn_blocking(move || thread::sleep(stuck)));
+        }
+        let weak = Arc::downgrade(&client);
+        let slot = ClientCell::new((client, runtime));
+        let accept_loop = RUNTIME.as_ref().unwrap().spawn(pending::<Result<()>>());
+        let (proxy, _) = monitor_proxy(accept_loop, tasks, Some(Arc::clone(&slot))).unwrap();
+        (proxy, TorClientWrapper { slot }, weak)
+    }
+
+    fn eventually(what: &str, within: Duration, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + within;
+        while !condition() {
+            assert!(Instant::now() < deadline, "gave up waiting until {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn wait_until(what: &str, condition: impl Fn() -> bool) -> bool {
@@ -1389,8 +1713,15 @@ mod tests {
                 drop(pending);
             });
             registered.wait();
+            let began = Instant::now();
             stop_all_registered(&registry, SWEEP_WAIT).unwrap();
             assert!(torn_down.load(Ordering::SeqCst));
+            // Woken when the start ends, not at the end of its wait.
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                began.elapsed()
+            );
         });
     }
 
@@ -1408,34 +1739,34 @@ mod tests {
     #[test]
     fn a_second_stop_returns_only_after_the_first_has_finished() {
         let tasks = TrackedTasks::default();
+        let task_ended = Arc::new(Mutex::new(None));
+        let ended = Arc::clone(&task_ended);
         // A task that ignores cancellation, so the first stop takes a while.
         RUNTIME
             .as_ref()
             .unwrap()
-            .spawn(tasks.tracker.track_future(async {
+            .spawn(tasks.tracker.track_future(async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
+                *lock_unpoisoned(&ended) = Some(Instant::now());
             }));
         let (proxy, _) = running_proxy(Some(tasks.clone()));
         let registry = Registry::new();
         register(&registry, &proxy);
 
-        let (first_finished, second_returned) = thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                let stopped = stop_all_registered(&registry, SWEEP_WAIT).unwrap();
-                (stopped, Instant::now())
-            });
+        let second_returned = thread::scope(|scope| {
+            let first = scope.spawn(|| stop_all_registered(&registry, SWEEP_WAIT).unwrap());
             while !tasks.cancellation.is_cancelled() {
                 thread::sleep(Duration::from_millis(1));
             }
-            // The first stop now holds the proxy and is waiting for its tasks.
+            // The first stop has taken the proxy and is waiting for its tasks.
             stop_registered_proxy(&registry, &proxy).unwrap();
             let second_returned = Instant::now();
-            let (stopped, first_finished) = first.join().unwrap();
-            assert_eq!(stopped, 1);
-            (first_finished, second_returned)
+            assert_eq!(first.join().unwrap(), 1);
+            second_returned
         });
 
-        assert!(second_returned >= first_finished);
+        let task_ended = lock_unpoisoned(&task_ended).expect("the task never ended");
+        assert!(second_returned >= task_ended, "the second stop didn't wait");
     }
 
     #[test]
@@ -1468,11 +1799,8 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_that_fails_to_stop_keeps_its_client() {
+    fn a_failed_stop_drops_its_client_once_its_tasks_end() {
         let dirs = OfflineDirs::new();
-        let (runtime, _) = create_arti_runtime().unwrap();
-        let client = dirs.client(runtime.clone()).unwrap();
-        let orphan = Arc::downgrade(&client);
         let tasks = TrackedTasks::default();
         // Outlasts the stop's 5 s bound, so the stop fails with tasks running.
         RUNTIME
@@ -1481,26 +1809,215 @@ mod tests {
             .spawn(tasks.tracker.track_future(async {
                 tokio::time::sleep(PROXY_SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
             }));
-        let (proxy, _) = running_proxy(Some(tasks));
-        lock_unpoisoned(&proxy.state).client = Some(Arc::new(Mutex::new(Some((client, runtime)))));
+        let (proxy, wrapper, client) = proxy_with_client(&dirs, Some(tasks.clone()), None);
         let registry = Registry::new();
         register(&registry, &proxy);
 
         let error = stop_all_registered(&registry, SWEEP_WAIT).unwrap_err();
+        // Give a release thread that didn't wait for the tasks time to act.
+        thread::sleep(Duration::from_millis(300));
+        assert!(!tasks.tracker.is_empty(), "the stuck task ended too soon");
 
-        let message = error.to_string();
         assert_eq!(
-            message,
+            error.to_string(),
             "Failed to stop proxy: stopped 0 of 1 Tor proxies cleanly: \
              Timed out stopping Tor client tasks"
         );
-        assert!(
-            orphan.upgrade().is_some(),
-            "a client with live tasks was dropped"
+        assert!(is_released(&wrapper));
+        assert!(client.upgrade().is_some(), "dropped while its tasks ran");
+        // A later stop learns that this one failed.
+        let later = stop_registered_proxy(&registry, &proxy).unwrap_err();
+        assert!(later
+            .to_string()
+            .contains("Another stop of this Tor proxy failed"));
+        // Once the stuck task ends, the release thread drops the client.
+        eventually("the client is dropped", Duration::from_secs(5), || {
+            client.upgrade().is_none()
+        });
+    }
+
+    #[test]
+    fn a_failed_start_keeps_its_runtime_until_its_tasks_end() {
+        /// Stands in for the runtime a failed start leaves behind.
+        struct Leftover(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for Leftover {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let tasks = TrackedTasks::default();
+        RUNTIME
+            .as_ref()
+            .unwrap()
+            .spawn(tasks.tracker.track_future(async {
+                tokio::time::sleep(PROXY_SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+            }));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let error = finish_failed_start(
+            None,
+            tasks.clone(),
+            TorError::BootstrapError("Bootstrap was cancelled".to_owned()),
+            Leftover(Arc::clone(&dropped)),
         );
-        assert!(lock_unpoisoned(&ZOMBIES)
-            .iter()
-            .any(|(zombie, _)| std::ptr::eq(Arc::as_ptr(zombie), orphan.as_ptr())));
+        // Give a release thread that didn't wait for the tasks time to act.
+        thread::sleep(Duration::from_millis(300));
+        assert!(!tasks.tracker.is_empty(), "the stuck task ended too soon");
+
+        assert!(matches!(error, TorError::RuntimeError(_)), "{error}");
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "dropped while its tasks ran"
+        );
+        eventually("the leftover is dropped", Duration::from_secs(5), || {
+            dropped.load(Ordering::SeqCst)
+        });
+    }
+
+    #[test]
+    fn a_client_drop_that_hangs_times_out_and_finishes_later() {
+        let dirs = OfflineDirs::new();
+        let stuck = CLIENT_RELEASE_TIMEOUT + Duration::from_millis(1500);
+        let (proxy, _wrapper, client) = proxy_with_client(&dirs, None, Some(stuck));
+        let registry = Registry::new();
+        register(&registry, &proxy);
+
+        let began = Instant::now();
+        let error = stop_registered_proxy(&registry, &proxy).unwrap_err();
+        let took = began.elapsed();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to stop proxy: Timed out releasing the Tor client; \
+             Arti's locks may still be held"
+        );
+        assert!(
+            took < CLIENT_RELEASE_TIMEOUT + Duration::from_secs(1),
+            "{took:?}"
+        );
+        assert!(!is_live(&registry, &proxy));
+        eventually("the client is dropped", Duration::from_secs(5), || {
+            client.upgrade().is_none()
+        });
+    }
+
+    #[test]
+    fn a_sweep_stays_bounded_when_a_client_drop_hangs() {
+        let dirs = OfflineDirs::new();
+        let stuck = CLIENT_RELEASE_TIMEOUT + Duration::from_secs(3);
+        let (hung, _hung_wrapper, _) = proxy_with_client(&dirs, None, Some(stuck));
+        let (fine, _fine_wrapper, fine_client) = proxy_with_client(&OfflineDirs::new(), None, None);
+        let registry = Registry::new();
+        register(&registry, &hung);
+        register(&registry, &fine);
+
+        let began = Instant::now();
+        let error = stop_all_registered(&registry, SWEEP_WAIT).unwrap_err();
+        let took = began.elapsed();
+
+        assert!(
+            took < CLIENT_RELEASE_TIMEOUT + Duration::from_secs(2),
+            "{took:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("stopped 1 of 2"), "{message}");
+        assert!(
+            message.contains("Timed out releasing the Tor client"),
+            "{message}"
+        );
+        assert!(fine_client.upgrade().is_none());
+    }
+
+    /// A bootstrap that never finishes and, once abandoned, takes a while to
+    /// let go of its client.
+    struct SlowToLetGo(#[allow(dead_code)] LiveClient);
+
+    impl Future for SlowToLetGo {
+        type Output = std::result::Result<(), arti_client::Error>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for SlowToLetGo {
+        fn drop(&mut self) {
+            thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    #[test]
+    fn a_stop_ends_a_re_bootstrap_that_borrowed_its_client() {
+        let dirs = OfflineDirs::new();
+        let (proxy, wrapper, client) = proxy_with_client(&dirs, None, None);
+        let registry = Registry::new();
+        register(&registry, &proxy);
+        let caller = CancellationToken::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = bootstrap_with(&registry, &wrapper, &caller, SlowToLetGo);
+                sender.send(result).unwrap();
+            });
+            assert!(wait_until("the re-bootstrap borrows the client", || {
+                lock_unpoisoned(&wrapper.slot.state).borrowers == 1
+            }));
+
+            let began = Instant::now();
+            let stopped = stop_registered_proxy(&registry, &proxy);
+            let took = began.elapsed();
+            let alive_after_stop = client.upgrade().is_some();
+            let ended = receiver.recv_timeout(Duration::from_secs(5));
+            caller.cancel(); // Only so a failing run doesn't hang.
+
+            stopped.unwrap();
+            assert!(took < Duration::from_secs(2), "{took:?}");
+            assert!(
+                !alive_after_stop,
+                "the stop returned before the client was gone"
+            );
+            let result = ended.expect("the stop didn't end the re-bootstrap");
+            assert!(matches!(result, Err(TorError::BootstrapError(_))));
+        });
+
+        // A re-bootstrap begun after the stop finds nothing to borrow.
+        assert!(matches!(
+            bootstrap_with(&registry, &wrapper, &caller, |_| {
+                pending::<std::result::Result<(), arti_client::Error>>()
+            }),
+            Err(TorError::ClientNotInitialized)
+        ));
+    }
+
+    #[test]
+    fn a_sweep_reports_an_owner_stop_that_failed_to_release() {
+        let registry = Registry::new();
+        let stop = InFlight::stop(&registry);
+        let registered = std::sync::Barrier::new(2);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                registered.wait();
+                wait_until("the sweep begins", || stop.token.is_cancelled());
+                stop.mark_unclean();
+                drop(stop);
+            });
+            registered.wait();
+            let message = stop_all_registered(&registry, SWEEP_WAIT)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("couldn't release their client"),
+                "{message}"
+            );
+        });
+        assert!(registry.lock().unclean.is_empty());
     }
 
     // Through the process-wide registry and the FFI entry points.
@@ -1534,7 +2051,7 @@ mod tests {
         );
         // What the Dart wrapper still holds is empty, so disposing it can't
         // drop a client, or its runtime, on the Dart thread.
-        assert!(instance.client.client().is_none());
+        assert!(is_released(&instance.client));
         set_dormant(&instance.client, true);
         assert!(matches!(
             bootstrap(&instance.client, &TorBootstrapCancellationToken::new()),
@@ -1562,7 +2079,7 @@ mod tests {
             client.upgrade().is_none(),
             "the orphaned client is still alive"
         );
-        assert!(wrapper.client().is_none());
+        assert!(is_released(&wrapper));
         assert!(REGISTRY.lock().live.is_empty());
         assert_swept(leaked.proxy_monitor.clone());
     }
@@ -1629,7 +2146,7 @@ mod tests {
         let (runtime, _) = create_arti_runtime().unwrap();
         let client = dirs.client(runtime.clone()).unwrap();
         let wrapper = TorClientWrapper {
-            slot: Arc::new(Mutex::new(Some((client, runtime)))),
+            slot: ClientCell::new((client, runtime)),
         };
         let caller = CancellationToken::new();
         let (sender, receiver) = std::sync::mpsc::channel();
