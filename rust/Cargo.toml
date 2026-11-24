@@ -18,7 +18,10 @@ futures = "0.3"
 lazy_static = "1.4"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-libc = "0.2"
+# Held below 0.2.190 until Arti's tor-memquota allows a sysinfo that builds
+# for iOS: libc 0.2.190 made proc_pidinfo, PROC_PIDLISTFDS and proc_fdinfo
+# macOS-only, and sysinfo 0.38.4 (the newest 0.38) uses them on iOS too.
+libc = ">=0.2.186, <0.2.190"
 liblzma = { version = "0.4.9", features = ["static"] }
 # TLS to relays is rustls with the aws-lc-rs provider, the backend Arti
 # recommends, on every platform: no OpenSSL, no native-tls. Default features

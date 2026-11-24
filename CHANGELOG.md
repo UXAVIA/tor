@@ -21,6 +21,7 @@ SPDX-License-Identifier: MIT
 * TLS to relays now uses rustls with the aws-lc-rs provider on every platform, the configuration Arti recommends, instead of native-tls: OpenSSL (vendored and statically linked on Android) and Security.framework (iOS) are no longer used, and `openssl-src`, `openssl-sys`, `native-tls` and `security-framework` have left the dependency tree. Relay certificates are still authenticated by Arti in the Tor handshake, not by the TLS library, and TLS sessions are never resumed. Building the Rust library no longer needs `perl` or `make`; aws-lc-sys is compiled with the target's C compiler.
 * The bundled AWS-LC is always the one built: cargokit's build sets `AWS_LC_SYS_USE_SYSTEM=0` (and its target-suffixed form) for every target, and `rust/.cargo/config.toml` does the same for cargo run from `rust/`, so `OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR`/`OPENSSL_LIB_DIR` or pkg-config can't swap in a system AWS-LC or OpenSSL. `AWS_LC_SYS_SYSTEM_DIR` now fails the build.
 * The crate must be built with `panic = "unwind"`, which `rust/Cargo.toml` now states for the dev and release profiles: a stop can make Arti panic on a Tokio worker, which only unwinding keeps harmless. The library refuses to compile otherwise, and a test checks the profiles.
+* `libc` is held below 0.2.190 (now 0.2.189, with `mio` 1.2.4): libc 0.2.190 made `proc_pidinfo`, `PROC_PIDLISTFDS` and `proc_fdinfo` macOS-only, and sysinfo 0.38.4, which Arti's tor-memquota requires, uses them on iOS as well, so the iOS build failed.
 
 ## 0.2.2
 
