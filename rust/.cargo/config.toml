@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Foundation Devices Inc.
+#
+# SPDX-License-Identifier: MIT
+
+# Read only by cargo run from this directory (tests, local builds). cargokit
+# runs cargo from its own temp directory, so it never reads this file and sets
+# the same variables in cargokit/build_tool/lib/src/builder.dart instead.
+
+[env]
+# aws-lc-sys builds its bundled AWS-LC only with USE_SYSTEM=0. Otherwise it
+# links an AWS-LC or OpenSSL install found through OPENSSL_DIR,
+# OPENSSL_INCLUDE_DIR / OPENSSL_LIB_DIR or pkg-config. It reads the
+# target-suffixed name first, so the shipped targets get theirs too; `force`
+# overrides the caller's environment.
+AWS_LC_SYS_USE_SYSTEM = { value = "0", force = true }
+AWS_LC_SYS_USE_SYSTEM_aarch64_linux_android = { value = "0", force = true }
+AWS_LC_SYS_USE_SYSTEM_armv7_linux_androideabi = { value = "0", force = true }
+AWS_LC_SYS_USE_SYSTEM_x86_64_linux_android = { value = "0", force = true }
+AWS_LC_SYS_USE_SYSTEM_aarch64_apple_ios = { value = "0", force = true }

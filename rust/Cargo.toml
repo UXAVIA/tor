@@ -61,5 +61,17 @@ thiserror = "1.0"
 tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs"] }
 
+# Panics must unwind, never abort. Arti's tor-circmgr `expect`s the spawn of
+# every tunnel-building task, and once a stop has closed the client's tracked
+# spawner that spawn is refused, so a stop that races a circuit build panics
+# on a Tokio worker. Tokio catches an unwinding panic and the stop completes;
+# with `panic = "abort"` every such stop would kill the app. src/lib.rs refuses
+# to compile without unwinding, and a test checks these profiles.
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

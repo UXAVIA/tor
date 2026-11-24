@@ -157,13 +157,33 @@ class RustBuilder {
         '--target-dir',
         environment.targetTempDir,
       ],
-      environment: await _buildEnvironment(),
+      environment: {
+        ...await _buildEnvironment(),
+        ...pinnedCrateEnvironment(target.rust),
+      },
     );
     return path.join(
       environment.targetTempDir,
       target.rust,
       environment.configuration.rustName,
     );
+  }
+
+  /// Build-script settings that hold for every build of the tor plugin's
+  /// crate, whatever the caller's environment. cargo runs from cargokit's temp
+  /// directory, so it never reads the crate's own `.cargo/config.toml`; these
+  /// are set here instead and override the caller's values.
+  ///
+  /// aws-lc-sys builds its bundled AWS-LC only with `AWS_LC_SYS_USE_SYSTEM=0`.
+  /// Otherwise it links an AWS-LC or OpenSSL install it finds through
+  /// `OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR`/`OPENSSL_LIB_DIR` or pkg-config. It
+  /// reads the target-suffixed name first, so both are set.
+  static Map<String, String> pinnedCrateEnvironment(String rustTarget) {
+    final suffix = rustTarget.toLowerCase().replaceAll('-', '_');
+    return {
+      'AWS_LC_SYS_USE_SYSTEM': '0',
+      'AWS_LC_SYS_USE_SYSTEM_$suffix': '0',
+    };
   }
 
   Future<Map<String, String>> _buildEnvironment() async {

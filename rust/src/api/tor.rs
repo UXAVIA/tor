@@ -2464,4 +2464,27 @@ mod tests {
             "the second connection resumed the first one's TLS session"
         );
     }
+
+    /// Arti's tor-circmgr `expect`s the spawn of every tunnel-building task,
+    /// and the tracked spawner refuses spawns once a stop has closed it, so a
+    /// stop that races a circuit build panics on a Tokio worker. Tokio catches
+    /// that only when panics unwind; with `panic = "abort"` the stop would end
+    /// the app. Cargo always builds tests with unwinding, so this also reads
+    /// the profiles the library is built with.
+    #[test]
+    fn panics_unwind_so_a_stop_cannot_abort_the_app() {
+        const { assert!(cfg!(panic = "unwind"), "built with panic = \"abort\"") };
+
+        let manifest = include_str!("../../Cargo.toml");
+        let panic_settings: Vec<&str> = manifest
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("panic"))
+            .collect();
+        assert_eq!(
+            panic_settings,
+            ["panic = \"unwind\"", "panic = \"unwind\""],
+            "rust/Cargo.toml must set panic = \"unwind\" in [profile.dev] and [profile.release], and nothing else"
+        );
+    }
 }
