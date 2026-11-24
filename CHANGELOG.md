@@ -14,6 +14,7 @@ SPDX-License-Identifier: MIT
 * A start cancelled after its bootstrap finished now fails natively with a cancelled-bootstrap error, instead of returning a proxy for Dart to tear down.
 * A stop of a proxy that another stop is already stopping now waits for that stop to finish.
 * The Android build no longer pins its own Android Gradle Plugin on a buildscript classpath; the app's is used, as it already was. The plugin's `android/` directory therefore can't be synced on its own, outside an app.
+* The Rust toolchain is now 1.100.0 (was 1.91.0).
 
 ## 0.2.2
 
