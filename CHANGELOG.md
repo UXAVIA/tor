@@ -15,6 +15,7 @@ SPDX-License-Identifier: MIT
 * A stop of a proxy that another stop is already stopping now waits for that stop to finish.
 * The Android build no longer pins its own Android Gradle Plugin on a buildscript classpath; the app's is used, as it already was. The plugin's `android/` directory therefore can't be synced on its own, outside an app.
 * The Rust toolchain is now 1.100.0 (was 1.91.0).
+* Refreshed `rust/Cargo.lock` to the newest compatible crates, among them hickory-proto 0.26.3, url 2.5.9, tokio 1.54.1, zstd 0.14 / zstd-safe 8.3 / zstd-sys 2.1.3, and liblzma 0.4.9, which bundles xz 5.8.4. The `liblzma` requirement is now 0.4.9.
 
 ## 0.2.2
 
