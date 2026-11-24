@@ -18,6 +18,7 @@ SPDX-License-Identifier: MIT
 * Refreshed `rust/Cargo.lock` to the newest compatible crates, among them hickory-proto 0.26.3, url 2.5.9, tokio 1.54.1, zstd 0.14 / zstd-safe 8.3 / zstd-sys 2.1.3, and liblzma 0.4.9, which bundles xz 5.8.4. The `liblzma` requirement is now 0.4.9.
 * Upgraded Arti to 2.8.0 (`arti-client`, `tor-rtcompat` and `tor-config` 0.48.0), for TROVE-2026-047 (high: half-stream memory use and a dropped-cells side channel) and the 2.7.0 directory fixes TROVE-2026-028, -029, -044, -045, -046 and -048. Arti 2.7 and later need Rust 1.92.
 * The client's runtime now provides the `JoinSet` Arti 0.48 requires. Its tasks are tracked like the client's other tasks, so a stop cancels them and waits for them.
+* TLS to relays now uses rustls with the aws-lc-rs provider on every platform, the configuration Arti recommends, instead of native-tls: OpenSSL (vendored and statically linked on Android) and Security.framework (iOS) are no longer used, and `openssl-src`, `openssl-sys`, `native-tls` and `security-framework` have left the dependency tree. Relay certificates are still authenticated by Arti in the Tor handshake, not by the TLS library, and TLS sessions are never resumed. Building the Rust library no longer needs `perl` or `make`; aws-lc-sys is compiled with the target's C compiler.
 
 ## 0.2.2
 

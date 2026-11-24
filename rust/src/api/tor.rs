@@ -28,7 +28,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tor_config::Listen;
-use tor_rtcompat::tokio::TokioNativeTlsRuntime;
+use tor_rtcompat::tokio::TokioRustlsRuntime;
 use tor_rtcompat::{
     Blocking, CompoundRuntime, JoinSet, JoinSetProvider, NetStreamListener, NetStreamProvider,
     TcpListenOptions, ToplevelBlockOn,
@@ -51,12 +51,12 @@ const SANDBOXED_STORAGE: bool = cfg!(any(target_os = "ios", target_os = "android
 
 type TrackedTorRuntime = CompoundRuntime<
     TrackedSpawner,
-    TokioNativeTlsRuntime,
-    TokioNativeTlsRuntime,
-    TokioNativeTlsRuntime,
-    TokioNativeTlsRuntime,
-    TokioNativeTlsRuntime,
-    TokioNativeTlsRuntime,
+    TokioRustlsRuntime,
+    TokioRustlsRuntime,
+    TokioRustlsRuntime,
+    TokioRustlsRuntime,
+    TokioRustlsRuntime,
+    TokioRustlsRuntime,
 >;
 
 #[derive(Clone, Debug, Default)]
@@ -90,12 +90,12 @@ impl TrackedTasks {
 
 #[derive(Clone, Debug)]
 struct TrackedSpawner {
-    runtime: TokioNativeTlsRuntime,
+    runtime: TokioRustlsRuntime,
     tasks: TrackedTasks,
 }
 
 impl TrackedSpawner {
-    fn new(runtime: TokioNativeTlsRuntime) -> Self {
+    fn new(runtime: TokioRustlsRuntime) -> Self {
         Self {
             runtime,
             tasks: TrackedTasks::default(),
@@ -121,7 +121,7 @@ impl Spawn for TrackedSpawner {
 }
 
 impl Blocking for TrackedSpawner {
-    type ThreadHandle<T: Send + 'static> = <TokioNativeTlsRuntime as Blocking>::ThreadHandle<T>;
+    type ThreadHandle<T: Send + 'static> = <TokioRustlsRuntime as Blocking>::ThreadHandle<T>;
 
     fn spawn_blocking<F, T>(&self, f: F) -> Self::ThreadHandle<T>
     where
@@ -210,8 +210,22 @@ impl<T: Send + Sync + 'static> JoinSet<T> for TrackedJoinSet<T> {
     }
 }
 
+/// Arti's rustls backend leaves the cryptography provider to the application
+/// and won't build a runtime without one. This installs aws-lc-rs, the
+/// provider Arti recommends and installs itself, once per process; a provider
+/// that is already installed stays. rustls doesn't judge a relay's
+/// certificate: Arti's verifier only checks that it is well formed and that
+/// it signed the handshake, and the Tor handshake then authenticates it
+/// against the relay's identity key, so no root store is involved.
+fn install_crypto_provider() {
+    let _already_installed = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+}
+
 fn create_arti_runtime() -> io::Result<(TrackedTorRuntime, TrackedTasks)> {
-    let runtime = TokioNativeTlsRuntime::create()?;
+    install_crypto_provider();
+    let runtime = TokioRustlsRuntime::create()?;
     let spawner = TrackedSpawner::new(runtime.clone());
     let tasks = spawner.tasks.clone();
     let runtime = CompoundRuntime::new(
@@ -2332,5 +2346,122 @@ mod tests {
         dropped
             .recv_timeout(Duration::from_secs(5))
             .expect("the join set's task outlived the set");
+    }
+
+    #[test]
+    fn a_client_runtime_installs_the_aws_lc_rs_provider() {
+        use rustls::crypto::{aws_lc_rs, CryptoProvider};
+
+        let _runtime = create_arti_runtime().unwrap();
+
+        let installed = CryptoProvider::get_default().expect("no rustls provider is installed");
+        let expected = aws_lc_rs::default_provider();
+        let groups = |provider: &CryptoProvider| {
+            let groups = provider.kx_groups.iter().map(|group| group.name());
+            groups.collect::<Vec<_>>()
+        };
+        let suites = |provider: &CryptoProvider| {
+            let suites = provider.cipher_suites.iter().map(|suite| suite.suite());
+            suites.collect::<Vec<_>>()
+        };
+        assert_eq!(groups(installed), groups(&expected));
+        assert_eq!(suites(installed), suites(&expected));
+    }
+
+    /// A relay's TLS link certificate names a random host and comes from an
+    /// issuer nobody trusts; this one has expired as well. The TLS layer must
+    /// still connect, give Arti the certificate (the Tor handshake checks it
+    /// against the relay's CERTS cell) and export keying material, and must
+    /// never resume a session (tor-spec).
+    #[test]
+    fn relay_tls_leaves_the_certificate_to_the_tor_handshake_and_never_resumes() {
+        use futures::{AsyncReadExt, AsyncWriteExt};
+        use rcgen::{
+            date_time_ymd, BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair,
+            PKCS_RSA_SHA256,
+        };
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::{HandshakeKind, ServerConfig, ServerConnection, StreamOwned};
+        use std::io::{Read, Write};
+        use tor_rtcompat::tls::{CertifiedConn, TlsConnector};
+        use tor_rtcompat::{TcpConnectOptions, TlsProvider};
+
+        let (runtime, _tasks) = create_arti_runtime().unwrap();
+
+        let expired = |params: &mut CertificateParams| {
+            params.not_before = date_time_ymd(2020, 1, 1);
+            params.not_after = date_time_ymd(2020, 2, 1);
+        };
+        let issuer_key = KeyPair::generate_for(&PKCS_RSA_SHA256).unwrap();
+        let mut issuer_params = CertificateParams::default();
+        issuer_params
+            .distinguished_name
+            .push(DnType::CommonName, "www.fqbhxyeh2iuzqcj.com");
+        issuer_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        expired(&mut issuer_params);
+        let issuer = Issuer::new(issuer_params, issuer_key);
+        let link_key = KeyPair::generate_for(&PKCS_RSA_SHA256).unwrap();
+        let mut link_params =
+            CertificateParams::new(vec!["www.c7t5ahvthzmaadf.net".to_owned()]).unwrap();
+        expired(&mut link_params);
+        let link_cert = link_params.signed_by(&link_key, &issuer).unwrap();
+        let link_der = link_cert.der().to_vec();
+
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![link_cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(link_key.serialize_der().into()),
+                )
+                .unwrap(),
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = thread::spawn(move || {
+            let mut handshakes = Vec::new();
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().unwrap();
+                let connection = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+                let mut stream = StreamOwned::new(connection, tcp);
+                // Session tickets go out ahead of this byte, so the client
+                // has seen them by the time it has read it.
+                stream.write_all(b"x").unwrap();
+                stream.flush().unwrap();
+                handshakes.push(stream.conn.handshake_kind());
+                let mut rest = Vec::new();
+                let _ = stream.read_to_end(&mut rest);
+            }
+            handshakes
+        });
+
+        runtime.block_on(async {
+            for _ in 0..2 {
+                let options = TcpConnectOptions::default();
+                let tcp = runtime.connect(&address, &options).await.unwrap();
+                let mut tls = runtime
+                    .tls_connector()
+                    .negotiate_unvalidated(tcp, "www.example.com")
+                    .await
+                    .unwrap();
+                let mut byte = [0; 1];
+                tls.read_exact(&mut byte).await.unwrap();
+
+                assert_eq!(
+                    tls.peer_certificate().unwrap().as_deref(),
+                    Some(link_der.as_slice())
+                );
+                let exported = tls.export_keying_material(32, b"EXPORTER FOR TOR TLS", None);
+                assert_eq!(exported.unwrap().len(), 32);
+                tls.close().await.unwrap();
+            }
+        });
+
+        let handshakes = relay.join().unwrap();
+        assert_eq!(
+            handshakes,
+            [Some(HandshakeKind::Full), Some(HandshakeKind::Full)],
+            "the second connection resumed the first one's TLS session"
+        );
     }
 }
