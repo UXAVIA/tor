@@ -6,14 +6,20 @@ use anyhow::Result;
 use arti::proxy::{self, ListenProtocols};
 use arti_client::config::CfgPath;
 use arti_client::{DormantMode, TorClient, TorClientConfig};
+use async_trait::async_trait;
 use flutter_rust_bridge::frb;
-use futures::future::FutureObj;
+use futures::channel::oneshot;
+use futures::future::{self, Either, FutureObj};
+use futures::stream::{FuturesUnordered, StreamExt};
 use futures::task::{Spawn, SpawnError};
+use futures::FutureExt;
 use lazy_static::lazy_static;
+use std::any::Any;
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use tokio::runtime::{Builder, Runtime as TokioRuntime};
@@ -24,8 +30,8 @@ use tokio_util::task::TaskTracker;
 use tor_config::Listen;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tor_rtcompat::{
-    Blocking, CompoundRuntime, NetStreamListener, NetStreamProvider, TcpListenOptions,
-    ToplevelBlockOn,
+    Blocking, CompoundRuntime, JoinSet, JoinSetProvider, NetStreamListener, NetStreamProvider,
+    TcpListenOptions, ToplevelBlockOn,
 };
 
 lazy_static! {
@@ -145,6 +151,62 @@ impl Blocking for TrackedSpawner {
 impl ToplevelBlockOn for TrackedSpawner {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         self.runtime.block_on(future)
+    }
+}
+
+impl JoinSetProvider for TrackedSpawner {
+    type JoinSet<T: Send + Sync + 'static> = TrackedJoinSet<T>;
+
+    fn new_join_set<T>(&self) -> Self::JoinSet<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        TrackedJoinSet {
+            spawner: self.clone(),
+            pending: FuturesUnordered::new(),
+        }
+    }
+}
+
+type JoinOutput<T> = std::result::Result<T, Box<dyn Any + Send>>;
+
+/// The client's `JoinSet`. Its tasks go through the tracked spawner like
+/// every other task the client spawns, so a stop cancels them and waits for
+/// them. A task a stop cancelled has no output, and `join_next` skips it
+/// rather than panicking, which a `RemoteHandle` would do. Dropping the set
+/// ends its tasks, as with Tokio's `JoinSet`.
+#[frb(ignore)]
+struct TrackedJoinSet<T> {
+    spawner: TrackedSpawner,
+    pending: FuturesUnordered<oneshot::Receiver<JoinOutput<T>>>,
+}
+
+#[async_trait]
+impl<T: Send + Sync + 'static> JoinSet<T> for TrackedJoinSet<T> {
+    fn spawn<F>(&mut self, task: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
+        let (mut sender, receiver) = oneshot::channel();
+        self.spawner.spawn_obj(FutureObj::new(Box::new(async move {
+            let task = AssertUnwindSafe(task).catch_unwind();
+            let output = match future::select(sender.cancellation(), Box::pin(task)).await {
+                Either::Left(_) => return,
+                Either::Right((output, _)) => output,
+            };
+            let _ = sender.send(output);
+        })))?;
+        self.pending.push(receiver);
+        Ok(())
+    }
+
+    async fn join_next(&mut self) -> Option<JoinOutput<T>> {
+        while let Some(received) = self.pending.next().await {
+            if let Ok(output) = received {
+                return Some(output);
+            }
+        }
+        None
     }
 }
 
@@ -2199,5 +2261,76 @@ mod tests {
         let state_dir_name = state_dir.path().file_name().unwrap().to_str().unwrap();
         assert!(rejection.contains(state_dir_name), "{rejection}");
         create(true).unwrap();
+    }
+
+    /// Signals when the task holding it is dropped, finished or not.
+    struct DropSignal(std::sync::mpsc::Sender<()>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn a_join_set_returns_what_its_tasks_return_and_their_panics() {
+        let (runtime, _tasks) = create_arti_runtime().unwrap();
+        let mut set = runtime.new_join_set::<u32>();
+        set.spawn(async { 7 }).unwrap();
+        set.spawn(async { panic!("a join set task panicked") })
+            .unwrap();
+
+        let outputs = runtime.block_on(async {
+            let mut outputs = Vec::new();
+            while let Some(output) = set.join_next().await {
+                outputs.push(output.ok());
+            }
+            outputs
+        });
+
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains(&Some(7)));
+        assert!(outputs.contains(&None));
+    }
+
+    #[test]
+    fn a_stop_cancels_join_set_tasks_and_waits_for_them() {
+        let (runtime, tasks) = create_arti_runtime().unwrap();
+        let mut set = runtime.new_join_set::<()>();
+        let (sender, dropped) = std::sync::mpsc::channel();
+        let signal = DropSignal(sender);
+        set.spawn(async move {
+            let _signal = signal;
+            pending::<()>().await
+        })
+        .unwrap();
+
+        tasks.stop_and_wait().unwrap();
+
+        assert!(
+            dropped.try_recv().is_ok(),
+            "the stop returned before the join set's task ended"
+        );
+        assert!(runtime.block_on(set.join_next()).is_none());
+        assert!(set.spawn(async {}).is_err());
+    }
+
+    #[test]
+    fn dropping_a_join_set_ends_its_tasks() {
+        let (runtime, _tasks) = create_arti_runtime().unwrap();
+        let mut set = runtime.new_join_set::<()>();
+        let (sender, dropped) = std::sync::mpsc::channel();
+        let signal = DropSignal(sender);
+        set.spawn(async move {
+            let _signal = signal;
+            pending::<()>().await
+        })
+        .unwrap();
+
+        drop(set);
+
+        dropped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the join set's task outlived the set");
     }
 }
